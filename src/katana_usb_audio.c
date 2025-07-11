@@ -9,12 +9,15 @@
 #include "control.h"
 #include "usb.h"
 #include "card.h"
+#include "pcm.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Print3M");
 MODULE_DESCRIPTION("Katana USB AudioControl driver");
 
 static struct snd_card *card = NULL;
+static int control_interface_ready = 0;
+static int stream_interface_ready = 0;
 
 // Define supported devices (Katana only)
 static struct usb_device_id usb_table[] = {
@@ -39,6 +42,9 @@ static int katana_usb_probe(struct usb_interface *iface, const struct usb_device
 
 	// Exit if this is not the desired interface
 	int ifnum = iface->cur_altsetting->desc.bInterfaceNumber;
+	dev_info(&iface->dev, "Processing interface %d (looking for %d and %d)\n", 
+		 ifnum, AUDIO_CONTROL_IFACE_ID, AUDIO_STREAM_IFACE_ID);
+	
 	if (ifnum != AUDIO_CONTROL_IFACE_ID && ifnum != AUDIO_STREAM_IFACE_ID) {
 		dev_info(&iface->dev, "Wrong interface: %d\n", ifnum);
 		goto __error;
@@ -51,11 +57,6 @@ static int katana_usb_probe(struct usb_interface *iface, const struct usb_device
 
 	// Create a new ALSA card structure if not already created
 	if (card == NULL) {
-		err = katana_new_card(&dev->dev, card);
-		if (err != 0) {
-			goto __error;
-		}
-
 		// Find first free index for a new ALSA card
 		int idx = 0;
 		while (snd_card_ref(idx) != NULL) {
@@ -75,46 +76,68 @@ static int katana_usb_probe(struct usb_interface *iface, const struct usb_device
 		card->dev = &dev->dev;
 
 		dev_info(&iface->dev, "New ALSA card created: %s\n", card->longname);
-
-		err = snd_card_register(card);
-		if (err != 0) {
-			dev_err(&iface->dev, "ALSA card registration failed: %d\n", err);
-			snd_card_free(card);
-			goto __error;
-		}
-
-		dev_info(&iface->dev, "New ALSA card registered: %s\n", card->longname);
 	}
 
 	// Setup Audio Control component
-	if (ifnum == AUDIO_CONTROL_IFACE_ID) {
-		// Init new sound control structure
+	if (ifnum == AUDIO_CONTROL_IFACE_ID && !control_interface_ready) {
+		// Init volume control
 		struct snd_kcontrol *kctl_vol = snd_ctl_new1(&katana_vol_ctl, NULL);
 		if (kctl_vol == NULL) {
-			dev_err(&iface->dev, "New control instance creation failed\n");
+			dev_err(&iface->dev, "Volume control creation failed\n");
 			goto __error;
 		}
 
-		// Attach sound control structure
+		// Attach volume control
 		err = snd_ctl_add(card, kctl_vol);
 		if (err != 0) {
-			dev_err(&iface->dev, "Passing sound control to the card failed: %d\n", err);
+			dev_err(&iface->dev, "Adding volume control failed: %d\n", err);
 			snd_ctl_free_one(kctl_vol);
 			goto __error;
 		}
+
+		// Init mute control
+		struct snd_kcontrol *kctl_mute = snd_ctl_new1(&katana_mute_ctl, NULL);
+		if (kctl_mute == NULL) {
+			dev_err(&iface->dev, "Mute control creation failed\n");
+			goto __error;
+		}
+
+		// Attach mute control
+		err = snd_ctl_add(card, kctl_mute);
+		if (err != 0) {
+			dev_err(&iface->dev, "Adding mute control failed: %d\n", err);
+			snd_ctl_free_one(kctl_mute);
+			goto __error;
+		}
+
+		control_interface_ready = 1;
+		dev_info(&iface->dev, "Audio controls added successfully\n");
 	}
 
-	// Setip Audio Stream component
-	if (ifnum == AUDIO_STREAM_IFACE_ID) {
-		// Create PCM
+	// Setup Audio Stream component
+	if (ifnum == AUDIO_STREAM_IFACE_ID && !stream_interface_ready) {
+		// Create PCM device
 		struct snd_pcm *pcm;
-		err = snd_pcm_new(card, "My Chip", 0, 1, 1, &pcm);
-		/*
-			snd_pcm_hw_new <-- technical details of the device
-			snd_pcm_ops
-			snd_pcm_new()
-			snd_pcm_register()
-		*/
+		err = katana_pcm_new(card, &pcm);
+		if (err != 0) {
+			dev_err(&iface->dev, "PCM device creation failed: %d\n", err);
+			goto __error;
+		}
+		
+		stream_interface_ready = 1;
+		dev_info(&iface->dev, "PCM device created successfully\n");
+	}
+	
+		// Register the card only after both interfaces are ready
+	if (control_interface_ready && stream_interface_ready) {
+		err = snd_card_register(card);
+		if (err != 0) {
+			dev_err(&iface->dev, "ALSA card registration failed: %d\n", err);
+			goto __error;
+		}
+		dev_info(&iface->dev, "ALSA card registered successfully with all components\n");
+	} else {
+		dev_info(&iface->dev, "Interface %d processed, waiting for other interface...\n", ifnum);
 	}
 
 	dev_info(&iface->dev, "Everything works. Ifnum: %d\n", ifnum);
@@ -132,7 +155,13 @@ static void katana_usb_disconnect(struct usb_interface *iface)
 		This function is called when the driver is not able already to control the device.
 		Its main purpose is to clean everything up after the driver usage.
 	*/
-	snd_card_free(card);
+	if (card) {
+		snd_card_free(card);
+		card = NULL;
+	}
+	control_interface_ready = 0;
+	stream_interface_ready = 0;
+	
 	struct usb_device *dev = interface_to_usbdev(iface);
 	dev_info(&dev->dev, "The driver has been disconnected\n");
 }

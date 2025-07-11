@@ -7,6 +7,7 @@
 #include <sound/pcm.h>
 
 static int volume_value = 50; // Virtual value to be controlled (katana volume emulation)
+static int mute_value = 0;    // 0 = unmuted, 1 = muted
 
 int katana_volume_get(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol)
 {
@@ -61,7 +62,38 @@ int katana_volume_info(struct snd_kcontrol *kctl, struct snd_ctl_elem_info *uinf
 	return 0;
 }
 
-// Control structure template
+// Volume control callbacks
+int katana_mute_get(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.integer.value[0] = mute_value;
+	pr_info("GET mute: %d\n", mute_value);
+	return 0;
+}
+
+int katana_mute_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol)
+{
+	int changed = 0;
+
+	if (mute_value != ucontrol->value.integer.value[0]) {
+		mute_value = ucontrol->value.integer.value[0];
+		pr_info("PUT mute: %d\n", mute_value);
+		changed = 1;
+	}
+
+	return changed;
+}
+
+int katana_mute_info(struct snd_kcontrol *kctl, struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 1;
+
+	return 0;
+}
+
+// Control structure templates
 struct snd_kcontrol_new katana_vol_ctl = {
 	.iface	       = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name	       = "PCM Playback Volume", // SOURCE - DIRECTION - FUNCTION
@@ -71,4 +103,15 @@ struct snd_kcontrol_new katana_vol_ctl = {
 	.get	       = katana_volume_get,
 	.put	       = katana_volume_put,
 	.info	       = katana_volume_info,
+};
+
+struct snd_kcontrol_new katana_mute_ctl = {
+	.iface	       = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name	       = "PCM Playback Switch", // Mute control
+	.index	       = 0,
+	.access	       = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.private_value = 0xffff,
+	.get	       = katana_mute_get,
+	.put	       = katana_mute_put,
+	.info	       = katana_mute_info,
 };
