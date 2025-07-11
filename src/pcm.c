@@ -9,17 +9,17 @@
 #include <sound/initval.h>
 #include "pcm.h"
 #include <linux/uio.h>
+#include <sound/pcm.h>
+
+#ifndef SNDRV_DMA_ADDR_INVALID
+#define SNDRV_DMA_ADDR_INVALID (~0UL)
+#endif
 
 // Private data structure for our PCM device
 struct katana_pcm_data {
 	struct snd_card *card;
 	struct snd_pcm_substream *substream;
 	spinlock_t lock;
-	
-	// Audio buffer management
-	dma_addr_t dma_addr;
-	void *dma_area;
-	size_t dma_bytes;
 	
 	// Playback state
 	unsigned int buffer_size;
@@ -65,12 +65,52 @@ struct snd_pcm_hardware katana_pcm_playback_hw = {
 	.rate_max = 96000,
 	.channels_min = 2,
 	.channels_max = 2,
-	.buffer_bytes_max = 32768,
-	.period_bytes_min = 4096,
-	.period_bytes_max = 32768,
+	.buffer_bytes_max = 32768, // period_bytes_max * periods_max = 4096 * 8
+	.period_bytes_min = 1024, // Reduced minimum period size
+	.period_bytes_max = 4096, // Reduced maximum period size
 	.periods_min = 2,
 	.periods_max = 8,
 };
+
+// Constraint lists
+static const unsigned int katana_rates[] = {
+	8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000
+};
+
+static const struct snd_pcm_hw_constraint_list katana_rate_constraints = {
+	.count = ARRAY_SIZE(katana_rates),
+	.list = katana_rates,
+};
+
+static const unsigned int katana_channels[] = {
+	2
+};
+
+static const struct snd_pcm_hw_constraint_list katana_channel_constraints = {
+	.count = ARRAY_SIZE(katana_channels),
+	.list = katana_channels,
+};
+
+// Custom constraint function to ensure buffer_bytes = period_bytes * periods
+static int katana_buffer_constraint(struct snd_pcm_hw_params *params,
+				   struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval *buffer_bytes = hw_param_interval(params, SNDRV_PCM_HW_PARAM_BUFFER_BYTES);
+	struct snd_interval *period_bytes = hw_param_interval(params, SNDRV_PCM_HW_PARAM_PERIOD_BYTES);
+	struct snd_interval *periods = hw_param_interval(params, SNDRV_PCM_HW_PARAM_PERIODS);
+	
+	// Calculate the valid buffer bytes range based on period_bytes and periods
+	unsigned int min_buffer = period_bytes->min * periods->min;
+	unsigned int max_buffer = period_bytes->max * periods->max;
+	
+	// Update buffer_bytes to be within the valid range
+	if (buffer_bytes->min < min_buffer)
+		buffer_bytes->min = min_buffer;
+	if (buffer_bytes->max > max_buffer)
+		buffer_bytes->max = max_buffer;
+	
+	return 0;
+}
 
 // PCM operations structure
 struct snd_pcm_ops katana_pcm_playback_ops = {
@@ -118,9 +158,40 @@ int katana_pcm_playback_open(struct snd_pcm_substream *substream)
 	data->substream = substream;
 	spin_lock_init(&data->lock);
 
+	// Set hardware constraints
 	substream->runtime->hw = katana_pcm_playback_hw;
 	substream->runtime->private_data = data;
-	substream->runtime->dma_bytes = katana_pcm_playback_hw.buffer_bytes_max;
+	
+	// Set DMA buffer constraints
+	snd_pcm_hw_constraint_list(substream->runtime, 0,
+				   SNDRV_PCM_HW_PARAM_RATE,
+				   &katana_rate_constraints);
+	snd_pcm_hw_constraint_list(substream->runtime, 0,
+				   SNDRV_PCM_HW_PARAM_CHANNELS,
+				   &katana_channel_constraints);
+	
+	// Enforce integer periods first
+	snd_pcm_hw_constraint_integer(substream->runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	
+	// Set periods constraints
+	snd_pcm_hw_constraint_minmax(substream->runtime, SNDRV_PCM_HW_PARAM_PERIODS,
+				     katana_pcm_playback_hw.periods_min,
+				     katana_pcm_playback_hw.periods_max);
+	
+	// Set period bytes constraints
+	snd_pcm_hw_constraint_minmax(substream->runtime, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
+				     katana_pcm_playback_hw.period_bytes_min,
+				     katana_pcm_playback_hw.period_bytes_max);
+	
+	// Set buffer bytes constraints to ensure buffer_bytes = period_bytes * periods
+	snd_pcm_hw_constraint_minmax(substream->runtime, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
+				     katana_pcm_playback_hw.period_bytes_min * katana_pcm_playback_hw.periods_min,
+				     katana_pcm_playback_hw.period_bytes_max * katana_pcm_playback_hw.periods_max);
+	
+	// Add custom constraint to enforce buffer_bytes = period_bytes * periods relationship
+	snd_pcm_hw_rule_add(substream->runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
+			    katana_buffer_constraint, NULL,
+			    SNDRV_PCM_HW_PARAM_PERIOD_BYTES, SNDRV_PCM_HW_PARAM_PERIODS, -1);
 
 	pr_info("Katana PCM playback opened\n");
 	return 0;
@@ -132,12 +203,6 @@ int katana_pcm_playback_close(struct snd_pcm_substream *substream)
 	struct katana_pcm_data *data = substream->runtime->private_data;
 
 	if (data) {
-		if (data->dma_area) {
-			dma_free_coherent(substream->pcm->card->dev,
-					  data->dma_bytes,
-					  data->dma_area,
-					  data->dma_addr);
-		}
 		kfree(data);
 	}
 
@@ -150,24 +215,10 @@ int katana_pcm_hw_params(struct snd_pcm_substream *substream,
 			 struct snd_pcm_hw_params *hw_params)
 {
 	struct katana_pcm_data *data = substream->runtime->private_data;
-	int err;
+	size_t buffer_bytes;
+	unsigned int periods;
 
-	err = snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params));
-	if (err < 0)
-		return err;
-
-	// Allocate DMA buffer
-	data->dma_bytes = params_buffer_bytes(hw_params);
-	data->dma_area = dma_alloc_coherent(substream->pcm->card->dev,
-					   data->dma_bytes,
-					   &data->dma_addr,
-					   GFP_KERNEL);
-	if (!data->dma_area) {
-		snd_pcm_lib_free_pages(substream);
-		return -ENOMEM;
-	}
-
-	// Store parameters
+	// Store parameters first
 	data->buffer_size = params_buffer_size(hw_params);
 	data->period_size = params_period_size(hw_params);
 	data->period_bytes = params_period_bytes(hw_params);
@@ -175,8 +226,59 @@ int katana_pcm_hw_params(struct snd_pcm_substream *substream,
 	data->rate = params_rate(hw_params);
 	data->format = params_format(hw_params);
 
-	pr_info("Katana PCM hw_params: rate=%d, channels=%d, format=%d, buffer_size=%d\n",
-		data->rate, data->channels, data->format, data->buffer_size);
+	buffer_bytes = params_buffer_bytes(hw_params);
+	periods = params_periods(hw_params);
+
+	// CRITICAL: Validate that buffer_bytes = period_bytes * periods
+	if (buffer_bytes != data->period_bytes * periods) {
+		pr_err("Katana PCM: Buffer constraint violation: buffer_bytes (%zu) != period_bytes (%u) * periods (%u)\n",
+		       buffer_bytes, data->period_bytes, periods);
+		return -EINVAL;
+	}
+
+	// Validate buffer size and periods
+	if (buffer_bytes < katana_pcm_playback_hw.period_bytes_min * katana_pcm_playback_hw.periods_min ||
+	    buffer_bytes > katana_pcm_playback_hw.period_bytes_max * katana_pcm_playback_hw.periods_max) {
+		pr_err("Katana PCM: Invalid buffer size %zu (min: %zu, max: %zu)\n",
+		       buffer_bytes, (size_t)(katana_pcm_playback_hw.period_bytes_min * katana_pcm_playback_hw.periods_min),
+		       (size_t)(katana_pcm_playback_hw.period_bytes_max * katana_pcm_playback_hw.periods_max));
+		return -EINVAL;
+	}
+	if (periods < katana_pcm_playback_hw.periods_min ||
+	    periods > katana_pcm_playback_hw.periods_max) {
+		pr_err("Katana PCM: Invalid periods %u (min: %u, max: %u)\n",
+		       periods, katana_pcm_playback_hw.periods_min, katana_pcm_playback_hw.periods_max);
+		return -EINVAL;
+	}
+
+	pr_info("buffer_bytes=%zu period_bytes=%u periods=%d\n",
+        params_buffer_bytes(hw_params),
+        params_period_bytes(hw_params),
+        params_periods(hw_params));
+
+	pr_info("hw: buffer_bytes_max=%zu, period_bytes_min=%zu, period_bytes_max=%zu, periods_min=%u, periods_max=%u\n",
+		katana_pcm_playback_hw.buffer_bytes_max,
+		katana_pcm_playback_hw.period_bytes_min,
+		katana_pcm_playback_hw.period_bytes_max,
+		katana_pcm_playback_hw.periods_min,
+		katana_pcm_playback_hw.periods_max);
+		
+
+	// For USB audio, we need to allocate regular kernel memory, not DMA pages
+	substream->runtime->dma_area = kmalloc(buffer_bytes, GFP_KERNEL);
+	if (!substream->runtime->dma_area) {
+		pr_err("Katana PCM: Failed to allocate buffer memory: buffer_bytes=%zu\n", buffer_bytes);
+		return -ENOMEM;
+	}
+	
+	substream->runtime->dma_bytes = buffer_bytes;
+	substream->runtime->dma_addr = SNDRV_DMA_ADDR_INVALID; // Not used for USB
+	
+	pr_info("Katana PCM: Allocated buffer: dma_area=%p dma_bytes=%zu\n", 
+		substream->runtime->dma_area, substream->runtime->dma_bytes);
+
+	pr_info("Katana PCM hw_params: rate=%d, channels=%d, format=%d, buffer_size=%d, buffer_bytes=%zu, period_bytes=%u, periods=%u\n",
+		data->rate, data->channels, data->format, data->buffer_size, buffer_bytes, data->period_bytes, periods);
 
 	return 0;
 }
@@ -184,17 +286,15 @@ int katana_pcm_hw_params(struct snd_pcm_substream *substream,
 // Free hardware resources
 int katana_pcm_hw_free(struct snd_pcm_substream *substream)
 {
-	struct katana_pcm_data *data = substream->runtime->private_data;
-
-	if (data && data->dma_area) {
-		dma_free_coherent(substream->pcm->card->dev,
-				 data->dma_bytes,
-				 data->dma_area,
-				 data->dma_addr);
-		data->dma_area = NULL;
+	// For USB audio, free the allocated kernel memory
+	if (substream->runtime->dma_area) {
+		kfree(substream->runtime->dma_area);
+		substream->runtime->dma_area = NULL;
+		substream->runtime->dma_bytes = 0;
+		substream->runtime->dma_addr = SNDRV_DMA_ADDR_INVALID;
+		pr_info("Katana PCM: Freed buffer memory\n");
 	}
-
-	return snd_pcm_lib_free_pages(substream);
+	return 0;
 }
 
 // Prepare for playback
@@ -283,15 +383,18 @@ int katana_pcm_copy(struct snd_pcm_substream *substream, int channel,
     unsigned long flags;
     unsigned int offset, size;
     ssize_t copied;
+    char *dma_area;
 
-    if (!data->dma_area)
+    // Get ALSA's DMA buffer
+    dma_area = substream->runtime->dma_area;
+    if (!dma_area)
         return -ENOMEM;
 
     offset = pos * data->channels * snd_pcm_format_physical_width(data->format) / 8;
     size = count * data->channels * snd_pcm_format_physical_width(data->format) / 8;
 
     // Copy data from iov_iter to DMA buffer
-    copied = copy_from_iter(data->dma_area + offset, size, src);
+    copied = copy_from_iter(dma_area + offset, size, src);
     if (copied != size)
         return -EFAULT;
 
