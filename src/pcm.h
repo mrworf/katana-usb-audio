@@ -3,6 +3,10 @@
 #include <sound/pcm.h>
 #include <sound/core.h>
 
+// Operation tracking functions for disconnect synchronization
+int katana_enter_operation(void);
+void katana_exit_operation(void);
+
 // PCM operations structure
 extern struct snd_pcm_ops katana_pcm_playback_ops;
 
@@ -19,3 +23,4 @@ int katana_pcm_prepare(struct snd_pcm_substream *substream);
 int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd);
 snd_pcm_uframes_t katana_pcm_pointer(struct snd_pcm_substream *substream);
 int katana_pcm_copy(struct snd_pcm_substream *substream, int channel, snd_pcm_uframes_t pos, struct iov_iter *src, snd_pcm_uframes_t count);
+void katana_pcm_invalidate_usb_dev(struct snd_card *card);

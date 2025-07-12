@@ -2,6 +2,9 @@
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/usb.h>
+#include <linux/delay.h>
+#include <linux/completion.h>
+#include <linux/atomic.h>
 #include <sound/control.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -15,9 +18,20 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Print3M");
 MODULE_DESCRIPTION("Katana USB AudioControl driver");
 
+// Export operation tracking functions for use by PCM module
+int katana_enter_operation(void);
+void katana_exit_operation(void);
+EXPORT_SYMBOL(katana_enter_operation);
+EXPORT_SYMBOL(katana_exit_operation);
+
 static struct snd_card *card = NULL;
 static int control_interface_ready = 0;
 static int stream_interface_ready = 0;
+
+// Disconnect synchronization
+static atomic_t disconnect_in_progress = ATOMIC_INIT(0);
+static atomic_t active_operations = ATOMIC_INIT(0);
+static DECLARE_COMPLETION(disconnect_completion);
 
 // Define supported devices (Katana only)
 static struct usb_device_id usb_table[] = {
@@ -27,6 +41,35 @@ static struct usb_device_id usb_table[] = {
 
 // These devices will be probed with this kernel module.
 MODULE_DEVICE_TABLE(usb, usb_table);
+
+// Implementation of exported functions for disconnect synchronization
+int katana_enter_operation(void)
+{
+	if (atomic_read(&disconnect_in_progress)) {
+		pr_debug("Katana USB: Operation blocked, disconnect in progress\n");
+		return -ENODEV;
+	}
+	atomic_inc(&active_operations);
+	
+	// Double-check after incrementing (race condition protection)
+	if (atomic_read(&disconnect_in_progress)) {
+		atomic_dec(&active_operations);
+		pr_debug("Katana USB: Operation blocked, disconnect in progress\n");
+		return -ENODEV;
+	}
+	
+	return 0;
+}
+
+void katana_exit_operation(void)
+{
+	if (atomic_dec_and_test(&active_operations)) {
+		// If we were the last operation and disconnect is waiting, signal completion
+		if (atomic_read(&disconnect_in_progress)) {
+			complete(&disconnect_completion);
+		}
+	}
+}
 
 static int katana_usb_probe(struct usb_interface *iface, const struct usb_device_id *id)
 {
@@ -74,6 +117,9 @@ static int katana_usb_probe(struct usb_interface *iface, const struct usb_device
 		strcpy(card->shortname, "Katana Audio");
 		strcpy(card->longname, "SoundBlaster X Katana");
 		card->dev = &dev->dev;
+		
+		// Store the USB device in the card's private data for PCM operations
+		card->private_data = dev;
 
 		dev_info(&iface->dev, "New ALSA card created: %s\n", card->longname);
 	}
@@ -155,14 +201,49 @@ static void katana_usb_disconnect(struct usb_interface *iface)
 		This function is called when the driver is not able already to control the device.
 		Its main purpose is to clean everything up after the driver usage.
 	*/
+	struct usb_device *dev = interface_to_usbdev(iface);
+	
 	if (card) {
+		pr_info("Katana USB: Disconnecting device, setting disconnect flag\n");
+		
+		// Step 1: Set disconnect flag to block new operations
+		atomic_set(&disconnect_in_progress, 1);
+		
+		// Step 2: Invalidate USB device in all PCM substreams
+		// This prevents use-after-free bugs when the card is freed
+		katana_pcm_invalidate_usb_dev(card);
+		
+		// Step 3: Wait for all active operations to complete
+		// Check if there are any active operations
+		if (atomic_read(&active_operations) > 0) {
+			pr_info("Katana USB: Waiting for %d active operations to complete\n", 
+				atomic_read(&active_operations));
+			
+			// Re-initialize completion for this disconnect
+			reinit_completion(&disconnect_completion);
+			
+			// Wait for completion with timeout (10 seconds max)
+			unsigned long timeout = wait_for_completion_timeout(&disconnect_completion, 
+								   msecs_to_jiffies(10000));
+			if (timeout == 0) {
+				pr_warn("Katana USB: Timeout waiting for operations to complete, forcing disconnect\n");
+			} else {
+				pr_info("Katana USB: All operations completed, proceeding with disconnect\n");
+			}
+		}
+		
+		// Step 4: Now it's safe to free the card
 		snd_card_free(card);
 		card = NULL;
+		
+		// Step 5: Reset disconnect state for potential future reconnection
+		atomic_set(&disconnect_in_progress, 0);
+		atomic_set(&active_operations, 0);
 	}
+	
 	control_interface_ready = 0;
 	stream_interface_ready = 0;
 	
-	struct usb_device *dev = interface_to_usbdev(iface);
 	dev_info(&dev->dev, "The driver has been disconnected\n");
 }
 

@@ -5,6 +5,7 @@
 #include <sound/control.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
+#include "control.h"
 
 static int volume_value = 50; // Virtual value to be controlled (katana volume emulation)
 static int mute_value = 0;    // 0 = unmuted, 1 = muted

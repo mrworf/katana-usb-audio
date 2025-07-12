@@ -2,6 +2,7 @@
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <sound/core.h>
+#include "card.h"
 
 int katana_new_card(struct device *dev, struct snd_card *card)
 {
