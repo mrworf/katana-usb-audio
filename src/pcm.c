@@ -43,8 +43,8 @@ struct katana_pcm_data {
 	unsigned int format;
 	
 	// Hardware pointer tracking
-	unsigned int hw_ptr;
-	unsigned int appl_ptr;
+	unsigned int hw_ptr;      // Where hardware has finished playing
+	unsigned int last_period_hw_ptr; // Last hw_ptr when we called period_elapsed
 	
 	// Playback status
 	int running;
@@ -216,7 +216,6 @@ struct snd_pcm_ops katana_pcm_playback_ops = {
 	.prepare = katana_pcm_prepare,
 	.trigger = katana_pcm_trigger,
 	.pointer = katana_pcm_pointer,
-	.copy = katana_pcm_copy,
 };
 
 // Create new PCM device
@@ -289,7 +288,7 @@ int katana_pcm_playback_open(struct snd_pcm_substream *substream)
 	data->rate = 0;
 	data->format = 0;
 	data->hw_ptr = 0;
-	data->appl_ptr = 0;
+	data->last_period_hw_ptr = 0;
 	data->running = 0;
 	data->prepared = 0;
 	data->start_time = 0;
@@ -560,8 +559,7 @@ int katana_pcm_prepare(struct snd_pcm_substream *substream)
 	spin_lock_irqsave(&data->lock, flags);
 	
 	data->hw_ptr = 0;
-	data->appl_ptr = 0;
-	data->prepared = 1;
+	data->last_period_hw_ptr = 0;
 	data->running = 0;
 	data->start_time = jiffies;
 
@@ -634,6 +632,7 @@ int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		data->stream_started = 1;
 		data->start_time = jiffies;
 		data->hw_ptr = 0;
+		data->last_period_hw_ptr = 0;
 		
 		// Start URB streaming (interface already activated in prepare)
 		for (i = 0; i < data->num_urbs; i++) {
@@ -653,6 +652,8 @@ int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 				spin_unlock_irqrestore(&data->lock, flags);
 				if (should_block) katana_exit_operation();
 				return err;
+			} else {
+				pr_debug("Katana PCM: Successfully submitted URB %d\n", i);
 			}
 		}
 		
@@ -713,90 +714,11 @@ snd_pcm_uframes_t katana_pcm_pointer(struct snd_pcm_substream *substream)
 
 	spin_lock_irqsave(&data->lock, flags);
 	
-	if (data->running) {
-		// Simulate hardware pointer advancement based on time
-		// In a real implementation, this would read from actual hardware
-		unsigned long jiffies_diff = jiffies - data->start_time;
-		unsigned int frames_played = (jiffies_diff * data->rate) / HZ;
-		pos = frames_played % data->buffer_size;
-	} else {
-		pos = data->hw_ptr;
-	}
+	// Always return the actual hardware pointer
+	pos = data->hw_ptr;
 
 	spin_unlock_irqrestore(&data->lock, flags);
 	return pos;
-}
-
-// Copy audio data from user space to DMA buffer (iov_iter version)
-int katana_pcm_copy(struct snd_pcm_substream *substream, int channel,
-                  snd_pcm_uframes_t pos, struct iov_iter *src, snd_pcm_uframes_t count)
-{
-    struct katana_pcm_data *data = substream->runtime->private_data;
-    unsigned long flags;
-    unsigned int offset, size;
-    ssize_t copied;
-    char *dma_area;
-    int err;
-
-    // Check if disconnect is in progress
-    err = katana_enter_operation();
-    if (err < 0) {
-        return err;
-    }
-
-    // DEFENSIVE: Check if private data is still valid
-    if (!data) {
-        pr_warn("Katana PCM copy: private data is NULL\n");
-        katana_exit_operation();
-        return -ENODEV;
-    }
-    
-    // Check if USB device is still valid
-    if (!data->usb_dev_valid) {
-        pr_warn("Katana PCM copy: USB device is no longer valid\n");
-        katana_exit_operation();
-        return -ENODEV;
-    }
-
-    // Get ALSA's PCM buffer
-    dma_area = substream->runtime->dma_area;
-    if (!dma_area) {
-        katana_exit_operation();
-        return -ENOMEM;
-    }
-
-    offset = pos * data->channels * snd_pcm_format_physical_width(data->format) / 8;
-    size = count * data->channels * snd_pcm_format_physical_width(data->format) / 8;
-
-    // Copy data from iov_iter to ALSA PCM buffer
-    copied = copy_from_iter(dma_area + offset, size, src);
-    if (copied != size) {
-        katana_exit_operation();
-        return -EFAULT;
-    }
-
-    spin_lock_irqsave(&data->lock, flags);
-    
-    // **USB AUDIO DATA FLOW**
-    // Data is now in the ALSA PCM buffer. The URB completion handler
-    // will copy data from the PCM buffer to URB buffers as needed.
-    // This provides a decoupled approach where:
-    // 1. Userspace writes to PCM buffer (here)
-    // 2. URB completion handler copies PCM data to URB buffers
-    // 3. URBs transfer data to USB device
-
-    // Update application pointer
-    data->appl_ptr = pos + count;
-    if (data->appl_ptr >= data->buffer_size)
-        data->appl_ptr -= data->buffer_size;
-
-    spin_unlock_irqrestore(&data->lock, flags);
-
-    pr_debug("Katana PCM copy: pos=%lu, count=%lu, size=%u, appl_ptr=%u\n", 
-             pos, count, size, data->appl_ptr);
-
-    katana_exit_operation();
-    return 0;
 }
 
 // URB completion handler for audio streaming
@@ -811,6 +733,7 @@ static void katana_urb_complete(struct urb *urb)
 	char *pcm_buffer;
 	unsigned int copy_offset;
 	unsigned int copy_size;
+	unsigned int available_frames;
 
 	if (!data->stream_started) {
 		return; // Stream was stopped
@@ -832,21 +755,50 @@ static void katana_urb_complete(struct urb *urb)
 		} else {
 			frames_to_copy = urb->actual_length / (data->channels * snd_pcm_format_physical_width(data->format) / 8);
 		}
+		
+		// Update hardware pointer - this represents what has been successfully sent to USB device
 		data->hw_ptr += frames_to_copy;
 		if (data->hw_ptr >= data->buffer_size) {
 			data->hw_ptr -= data->buffer_size;
 		}
+		
+		pr_debug("Katana URB success: transferred %u frames, hw_ptr now %u (buffer_size=%u)\n", 
+			frames_to_copy, data->hw_ptr, data->buffer_size);
+		
+		// Check if we've crossed a period boundary
+		unsigned int current_period = data->hw_ptr / data->period_size;
+		unsigned int last_period = data->last_period_hw_ptr / data->period_size;
+		int period_elapsed = 0;
+		
+		if (current_period != last_period) {
+			data->last_period_hw_ptr = data->hw_ptr;
+			period_elapsed = 1;
+			pr_debug("Katana PCM: Period elapsed at hw_ptr %u (period %u)\n", data->hw_ptr, current_period);
+		}
+		
+		spin_unlock_irqrestore(&data->lock, flags);
+		
+		// Call period_elapsed outside the lock to avoid deadlock
+		if (period_elapsed) {
+			snd_pcm_period_elapsed(substream);
+		}
+		
+		// Continue processing URB...
 		break;
 	case -ENOENT:
 	case -ECONNRESET:
 	case -ESHUTDOWN:
 		// URB was unlinked/cancelled
+		pr_debug("Katana URB cancelled: status %d\n", urb->status);
 		goto exit_unlock;
 	default:
-		pr_err("Katana URB error: %d\n", urb->status);
+		pr_err("Katana URB error: status %d\n", urb->status);
 		goto exit_unlock;
 	}
 
+	// Reacquire lock for URB processing
+	spin_lock_irqsave(&data->lock, flags);
+	
 	// Prepare next URB with data from PCM buffer
 	if (data->stream_started && data->running) {
 		frame_size = data->channels * snd_pcm_format_physical_width(data->format) / 8;
@@ -856,24 +808,55 @@ static void katana_urb_complete(struct urb *urb)
 		// Get PCM buffer pointer
 		pcm_buffer = substream->runtime->dma_area;
 		if (pcm_buffer) {
-			// Calculate offset in PCM buffer based on hardware pointer
-			copy_offset = (data->hw_ptr * frame_size) % substream->runtime->dma_bytes;
+			// Calculate how much data is available in the buffer
+			// Use ALSA's built-in application pointer (frames written by application)
+			snd_pcm_uframes_t appl_ptr = READ_ONCE(substream->runtime->control->appl_ptr);
+			snd_pcm_uframes_t hw_ptr_frames = data->hw_ptr;
 			
-			// Copy data from PCM buffer to URB buffer
-			// Handle wraparound at buffer boundary
-			if (copy_offset + copy_size <= substream->runtime->dma_bytes) {
-				// Simple copy - no wraparound
-				memcpy(urb->transfer_buffer, pcm_buffer + copy_offset, copy_size);
+			// Calculate available frames (with wraparound)
+			if (appl_ptr >= hw_ptr_frames) {
+				available_frames = appl_ptr - hw_ptr_frames;
 			} else {
-				// Wraparound copy
-				unsigned int first_part = substream->runtime->dma_bytes - copy_offset;
-				unsigned int second_part = copy_size - first_part;
+				available_frames = data->buffer_size - hw_ptr_frames + appl_ptr;
+			}
+			
+			// Limit copy to available data
+			if (frames_to_copy > available_frames) {
+				frames_to_copy = available_frames;
+				copy_size = frames_to_copy * frame_size;
+			}
+			
+			if (frames_to_copy > 0) {
+				pr_debug("Katana URB: hw_ptr=%u, appl_ptr=%lu, available=%u, copying=%u frames\n",
+					 data->hw_ptr, appl_ptr, available_frames, frames_to_copy);
 				
-				memcpy(urb->transfer_buffer, pcm_buffer + copy_offset, first_part);
-				memcpy((char*)urb->transfer_buffer + first_part, pcm_buffer, second_part);
+				// Calculate offset in PCM buffer based on hardware pointer
+				copy_offset = (data->hw_ptr * frame_size) % substream->runtime->dma_bytes;
+				
+				// Copy data from PCM buffer to URB buffer
+				// Handle wraparound at buffer boundary
+				if (copy_offset + copy_size <= substream->runtime->dma_bytes) {
+					// Simple copy - no wraparound
+					memcpy(urb->transfer_buffer, pcm_buffer + copy_offset, copy_size);
+				} else {
+					// Wraparound copy
+					unsigned int first_part = substream->runtime->dma_bytes - copy_offset;
+					unsigned int second_part = copy_size - first_part;
+					
+					memcpy(urb->transfer_buffer, pcm_buffer + copy_offset, first_part);
+					memcpy((char*)urb->transfer_buffer + first_part, pcm_buffer, second_part);
+				}
+				
+				// Fill remainder with silence if we didn't have enough data
+				if (copy_size < data->urb_buffer_size) {
+					memset((char*)urb->transfer_buffer + copy_size, 0, data->urb_buffer_size - copy_size);
+				}
+			} else {
+				// No data available, fill with silence
+				memset(urb->transfer_buffer, 0, data->urb_buffer_size);
 			}
 		} else {
-			// No PCM data available, fill with silence
+			// No PCM buffer available, fill with silence
 			memset(urb->transfer_buffer, 0, data->urb_buffer_size);
 		}
 		
@@ -881,16 +864,16 @@ static void katana_urb_complete(struct urb *urb)
 		err = usb_submit_urb(urb, GFP_ATOMIC);
 		if (err < 0) {
 			pr_err("Katana URB resubmit failed: %d\n", err);
+		} else {
+			pr_debug("Katana URB resubmitted successfully\n");
 		}
 	}
 
 exit_unlock:
 	spin_unlock_irqrestore(&data->lock, flags);
 	
-	// Notify ALSA of period completion
-	if (urb->status == 0 && data->stream_started) {
-		snd_pcm_period_elapsed(substream);
-	}
+	// Notify ALSA of period completion based on actual period boundaries
+	// This logic is now handled within the URB completion handler
 }
 
 // Allocate URB buffers for USB audio streaming
