@@ -10,6 +10,7 @@
 #include <sound/core.h>
 #include <sound/initval.h>
 #include "pcm.h"
+#include "usb.h"
 
 // Private data structure for our PCM device
 struct katana_pcm_data {
@@ -20,6 +21,11 @@ struct katana_pcm_data {
 	
 	// USB device state tracking
 	int usb_dev_valid;  // Track if USB device is still valid
+	
+	// USB endpoint information
+	struct usb_interface *usb_iface; // USB streaming interface
+	unsigned int endpoint_out;       // Output endpoint address
+	int altsetting_num;             // Alternate setting number for the endpoint
 	
 	// URB management for USB audio streaming
 	struct urb **urbs;        // Array of URBs for streaming
@@ -120,6 +126,78 @@ static int katana_buffer_constraint(struct snd_pcm_hw_params *params,
 	if (buffer_bytes->max > max_buffer)
 		buffer_bytes->max = max_buffer;
 	
+	return 0;
+}
+
+// Find the audio streaming endpoint
+static int katana_find_audio_endpoint(struct katana_pcm_data *data)
+{
+	struct usb_device *usb_dev = data->usb_dev;
+	struct usb_interface *iface = NULL;
+	struct usb_host_interface *altsetting;
+	struct usb_endpoint_descriptor *ep_desc;
+	int i, j;
+	
+	// Find the audio streaming interface (interface 1)
+	for (i = 0; i < usb_dev->config->desc.bNumInterfaces; i++) {
+		iface = usb_dev->config->interface[i];
+		if (iface->altsetting->desc.bInterfaceNumber == AUDIO_STREAM_IFACE_ID) {
+			data->usb_iface = iface;
+			break;
+		}
+	}
+	
+	if (!data->usb_iface) {
+		pr_err("Katana PCM: Could not find audio streaming interface\n");
+		return -ENODEV;
+	}
+	
+	// Check all alternate settings for the streaming interface
+	for (i = 0; i < iface->num_altsetting; i++) {
+		altsetting = &iface->altsetting[i];
+		
+		// Skip the null alternate setting (no endpoints)
+		if (altsetting->desc.bNumEndpoints == 0) {
+			continue;
+		}
+		
+		// Look for the audio streaming endpoint
+		for (j = 0; j < altsetting->desc.bNumEndpoints; j++) {
+			ep_desc = &altsetting->endpoint[j].desc;
+			
+			// Check if this is an OUT endpoint for audio streaming
+			if (usb_endpoint_is_bulk_out(ep_desc) || usb_endpoint_is_isoc_out(ep_desc)) {
+				data->endpoint_out = ep_desc->bEndpointAddress;
+				data->altsetting_num = altsetting->desc.bAlternateSetting;
+				pr_info("Katana PCM: Found audio streaming endpoint: 0x%02x (altsetting %d)\n",
+					data->endpoint_out, data->altsetting_num);
+				return 0;
+			}
+		}
+	}
+	
+	pr_err("Katana PCM: Could not find audio streaming endpoint\n");
+	return -ENODEV;
+}
+
+// Set the USB interface to the specified alternate setting
+static int katana_set_interface_altsetting(struct katana_pcm_data *data, int altsetting)
+{
+	int err;
+	
+	if (!data->usb_iface) {
+		pr_err("Katana PCM: No USB interface available\n");
+		return -ENODEV;
+	}
+	
+	err = usb_set_interface(data->usb_dev, AUDIO_STREAM_IFACE_ID, altsetting);
+	if (err < 0) {
+		pr_err("Katana PCM: Failed to set interface %d to altsetting %d: %d\n",
+		       AUDIO_STREAM_IFACE_ID, altsetting, err);
+		return err;
+	}
+	
+	pr_info("Katana PCM: Set interface %d to altsetting %d\n", AUDIO_STREAM_IFACE_ID, altsetting);
 	return 0;
 }
 
@@ -224,6 +302,18 @@ int katana_pcm_playback_open(struct snd_pcm_substream *substream)
 	data->urb_buffer_size = 0;
 	data->stream_started = 0;
 	data->active_urbs = 0;
+	data->usb_iface = NULL;
+	data->endpoint_out = 0;
+	data->altsetting_num = 0;
+	
+	// Find the audio streaming endpoint
+	err = katana_find_audio_endpoint(data);
+	if (err < 0) {
+		pr_err("Katana PCM: Failed to find audio endpoint: %d\n", err);
+		kfree(data);
+		katana_exit_operation();
+		return err;
+	}
 
 	// Set hardware constraints
 	substream->runtime->hw = katana_pcm_playback_hw;
@@ -427,7 +517,11 @@ int katana_pcm_hw_free(struct snd_pcm_substream *substream)
 	katana_free_urb_buffers(data);
 	pr_info("Katana PCM hw_free: URB buffers freed\n");
 	
-	// Step 2: Free ALSA PCM buffer
+	// Step 2: Deactivate the USB interface (process context - can sleep)
+	katana_set_interface_altsetting(data, 0);
+	pr_info("Katana PCM hw_free: Interface deactivated\n");
+	
+	// Step 3: Free ALSA PCM buffer
 	snd_pcm_lib_free_pages(substream);
 	pr_info("Katana PCM hw_free: ALSA buffer freed\n");
 	
@@ -472,6 +566,14 @@ int katana_pcm_prepare(struct snd_pcm_substream *substream)
 	data->start_time = jiffies;
 
 	spin_unlock_irqrestore(&data->lock, flags);
+
+	// Activate the USB interface for streaming (process context - can sleep)
+	err = katana_set_interface_altsetting(data, data->altsetting_num);
+	if (err < 0) {
+		pr_err("Katana PCM: Failed to activate interface during prepare: %d\n", err);
+		katana_exit_operation();
+		return err;
+	}
 
 	pr_info("Katana PCM prepared for playback\n");
 	katana_exit_operation();
@@ -533,7 +635,7 @@ int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		data->start_time = jiffies;
 		data->hw_ptr = 0;
 		
-		// Start URB streaming
+		// Start URB streaming (interface already activated in prepare)
 		for (i = 0; i < data->num_urbs; i++) {
 			// Initialize URB buffer with silence
 			memset(data->urb_buffers[i], 0, data->urb_buffer_size);
@@ -542,9 +644,9 @@ int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			err = usb_submit_urb(data->urbs[i], GFP_ATOMIC);
 			if (err < 0) {
 				pr_err("Katana PCM: Failed to submit URB %d: %d\n", i, err);
-				// Stop already submitted URBs
+				// Stop already submitted URBs (use unlink in atomic context)
 				for (i = i - 1; i >= 0; i--) {
-					usb_kill_urb(data->urbs[i]);
+					usb_unlink_urb(data->urbs[i]);
 				}
 				data->running = 0;
 				data->stream_started = 0;
@@ -561,9 +663,9 @@ int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		data->running = 0;
 		data->stream_started = 0;
 		
-		// Stop URB streaming
+		// Stop URB streaming (use unlink in atomic context)
 		for (i = 0; i < data->num_urbs; i++) {
-			usb_kill_urb(data->urbs[i]);
+			usb_unlink_urb(data->urbs[i]);
 		}
 		
 		pr_info("Katana PCM playback stopped\n");
@@ -719,7 +821,17 @@ static void katana_urb_complete(struct urb *urb)
 	switch (urb->status) {
 	case 0:
 		// Success - update hardware pointer
-		frames_to_copy = urb->actual_length / (data->channels * snd_pcm_format_physical_width(data->format) / 8);
+		// For isochronous URBs, we need to sum up the actual lengths of all packets
+		if (usb_pipeisoc(urb->pipe)) {
+			unsigned int total_length = 0;
+			int k;
+			for (k = 0; k < urb->number_of_packets; k++) {
+				total_length += urb->iso_frame_desc[k].actual_length;
+			}
+			frames_to_copy = total_length / (data->channels * snd_pcm_format_physical_width(data->format) / 8);
+		} else {
+			frames_to_copy = urb->actual_length / (data->channels * snd_pcm_format_physical_width(data->format) / 8);
+		}
 		data->hw_ptr += frames_to_copy;
 		if (data->hw_ptr >= data->buffer_size) {
 			data->hw_ptr -= data->buffer_size;
@@ -784,7 +896,65 @@ exit_unlock:
 // Allocate URB buffers for USB audio streaming
 static int katana_alloc_urb_buffers(struct katana_pcm_data *data)
 {
-	int i;
+	int i, j;
+	struct usb_host_interface *altsetting = NULL;
+	struct usb_endpoint_descriptor *ep_desc = NULL;
+	unsigned int max_packet_size = 0;
+	int is_isoc_endpoint = 0;
+	
+	// Find the correct alternate setting and endpoint descriptor ONCE
+	// We need to look in the altsetting where we found the endpoint,
+	// not the current altsetting (which might be 0 during hw_params)
+	if (data->usb_iface) {
+		// Find the altsetting where we discovered the endpoint
+		for (j = 0; j < data->usb_iface->num_altsetting; j++) {
+			if (data->usb_iface->altsetting[j].desc.bAlternateSetting == data->altsetting_num) {
+				altsetting = &data->usb_iface->altsetting[j];
+				break;
+			}
+		}
+		
+		// Find the endpoint descriptor in the correct altsetting
+		if (altsetting) {
+			for (j = 0; j < altsetting->desc.bNumEndpoints; j++) {
+				ep_desc = &altsetting->endpoint[j].desc;
+				if (ep_desc->bEndpointAddress == data->endpoint_out) {
+					break;
+				}
+			}
+			// Check if we found the endpoint
+			if (j >= altsetting->desc.bNumEndpoints) {
+				ep_desc = NULL; // Not found
+			}
+		}
+	}
+	
+	// Validate that we found the endpoint
+	if (!ep_desc) {
+		if (!altsetting) {
+			pr_err("Katana PCM: Could not find altsetting %d\n", data->altsetting_num);
+		} else {
+			pr_err("Katana PCM: Could not find endpoint descriptor for 0x%02x in altsetting %d\n",
+			       data->endpoint_out, data->altsetting_num);
+		}
+		return -ENODEV;
+	}
+	
+	// Determine endpoint type and get max packet size
+	if (usb_endpoint_is_bulk_out(ep_desc)) {
+		is_isoc_endpoint = 0;
+		max_packet_size = le16_to_cpu(ep_desc->wMaxPacketSize);
+		pr_info("Katana PCM: Setting up bulk URBs for endpoint 0x%02x (max_packet=%u)\n", 
+			data->endpoint_out, max_packet_size);
+	} else if (usb_endpoint_is_isoc_out(ep_desc)) {
+		is_isoc_endpoint = 1;
+		max_packet_size = le16_to_cpu(ep_desc->wMaxPacketSize);
+		pr_info("Katana PCM: Setting up isochronous URBs for endpoint 0x%02x (max_packet=%u)\n", 
+			data->endpoint_out, max_packet_size);
+	} else {
+		pr_err("Katana PCM: Endpoint 0x%02x is not a valid OUT endpoint\n", data->endpoint_out);
+		return -ENODEV;
+	}
 	
 	// Allocate URB array
 	data->urbs = kzalloc(sizeof(struct urb *) * data->num_urbs, GFP_KERNEL);
@@ -809,7 +979,7 @@ static int katana_alloc_urb_buffers(struct katana_pcm_data *data)
 	
 	// Allocate URBs and their buffers
 	for (i = 0; i < data->num_urbs; i++) {
-		data->urbs[i] = usb_alloc_urb(0, GFP_KERNEL);
+		data->urbs[i] = usb_alloc_urb(is_isoc_endpoint ? 32 : 0, GFP_KERNEL);
 		if (!data->urbs[i]) {
 			goto error_cleanup;
 		}
@@ -824,13 +994,47 @@ static int katana_alloc_urb_buffers(struct katana_pcm_data *data)
 			goto error_cleanup;
 		}
 		
-		// Set up the URB
-		usb_fill_bulk_urb(data->urbs[i], data->usb_dev,
-				  usb_sndbulkpipe(data->usb_dev, 1), // Endpoint 1 OUT
-				  data->urb_buffers[i],
-				  data->urb_buffer_size,
-				  katana_urb_complete,
-				  data);
+		// Set up the URB based on endpoint type
+		if (is_isoc_endpoint) {
+			// Use isochronous URB for isochronous endpoint
+			unsigned int packets_per_urb = (data->urb_buffer_size + max_packet_size - 1) / max_packet_size;
+			int k;
+			
+			// Limit number of packets to what the URB can handle
+			if (packets_per_urb > 32) {
+				packets_per_urb = 32;
+			}
+			
+			pr_debug("Katana PCM: URB %d: %u packets of %u bytes each\n", 
+				 i, packets_per_urb, max_packet_size);
+			
+			data->urbs[i]->dev = data->usb_dev;
+			data->urbs[i]->pipe = usb_sndisocpipe(data->usb_dev, data->endpoint_out & 0x0f);
+			data->urbs[i]->transfer_buffer = data->urb_buffers[i];
+			data->urbs[i]->transfer_buffer_length = packets_per_urb * max_packet_size;
+			data->urbs[i]->complete = katana_urb_complete;
+			data->urbs[i]->context = data;
+			data->urbs[i]->interval = 1;
+			data->urbs[i]->start_frame = -1;
+			data->urbs[i]->number_of_packets = packets_per_urb;
+			
+			// Set up each isochronous packet
+			for (k = 0; k < packets_per_urb; k++) {
+				data->urbs[i]->iso_frame_desc[k].offset = k * max_packet_size;
+				data->urbs[i]->iso_frame_desc[k].length = max_packet_size;
+			}
+		} else {
+			// Use bulk URB for bulk endpoint
+			pr_debug("Katana PCM: URB %d: bulk transfer of %u bytes\n", 
+				 i, data->urb_buffer_size);
+			
+			usb_fill_bulk_urb(data->urbs[i], data->usb_dev,
+					  usb_sndbulkpipe(data->usb_dev, data->endpoint_out & 0x0f),
+					  data->urb_buffers[i],
+					  data->urb_buffer_size,
+					  katana_urb_complete,
+					  data);
+		}
 		
 		data->urbs[i]->transfer_dma = data->urb_dma_addrs[i];
 		data->urbs[i]->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
