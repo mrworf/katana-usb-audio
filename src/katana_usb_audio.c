@@ -127,7 +127,7 @@ static int katana_usb_probe(struct usb_interface *iface, const struct usb_device
 	// Setup Audio Control component
 	if (ifnum == AUDIO_CONTROL_IFACE_ID && !control_interface_ready) {
 		// Init volume control
-		struct snd_kcontrol *kctl_vol = snd_ctl_new1(&katana_vol_ctl, NULL);
+		struct snd_kcontrol *kctl_vol = snd_ctl_new1(&katana_vol_ctl, card);
 		if (kctl_vol == NULL) {
 			dev_err(&iface->dev, "Volume control creation failed\n");
 			goto __error;
@@ -142,7 +142,7 @@ static int katana_usb_probe(struct usb_interface *iface, const struct usb_device
 		}
 
 		// Init mute control
-		struct snd_kcontrol *kctl_mute = snd_ctl_new1(&katana_mute_ctl, NULL);
+		struct snd_kcontrol *kctl_mute = snd_ctl_new1(&katana_mute_ctl, card);
 		if (kctl_mute == NULL) {
 			dev_err(&iface->dev, "Mute control creation failed\n");
 			goto __error;

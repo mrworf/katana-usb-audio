@@ -6,12 +6,10 @@
 #include <linux/uio.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
-#include <sound/control.h>
 #include <sound/core.h>
 #include <sound/initval.h>
 #include "pcm.h"
 #include "usb.h"
-#include "control.h"
 
 // Private data structure for our PCM device
 struct katana_pcm_data {
@@ -272,8 +270,6 @@ static int katana_alloc_urb_buffers(struct katana_pcm_data *data);
 static void katana_free_urb_buffers(struct katana_pcm_data *data);
 static void katana_urb_complete(struct urb *urb);
 static void katana_sync_urb_complete(struct urb *urb);
-static void apply_volume_control(void *buffer, unsigned int buffer_size, 
-				 unsigned int format, unsigned int channels);
 
 // PCM operations structure
 struct snd_pcm_ops katana_pcm_playback_ops = {
@@ -599,8 +595,7 @@ int katana_pcm_hw_params(struct snd_pcm_substream *substream,
 	data->stream_started = 0;
 	data->active_urbs = 0;
 
-	pr_info("Katana PCM: URB setup - %d URBs, %d packets per URB, %d bytes per packet, %d total buffer size\n",
-		data->num_urbs, packets_per_urb, packet_size, data->urb_buffer_size);
+	// URB setup complete
 
 	// Step 4: Allocate USB URB buffers for hardware transfers
 	err = katana_alloc_urb_buffers(data);
@@ -611,8 +606,7 @@ int katana_pcm_hw_params(struct snd_pcm_substream *substream,
 		return err;
 	}
 
-	pr_info("Katana PCM: URB buffers allocated successfully (%d URBs, %d bytes each)\n",
-		data->num_urbs, data->urb_buffer_size);
+	// URB buffers allocated successfully
 
 	katana_exit_operation();
 	return 0;
@@ -639,7 +633,7 @@ int katana_pcm_hw_free(struct snd_pcm_substream *substream)
 	// Step 1: Stop streaming and free URB buffers
 	data->stream_started = 0;
 	katana_free_urb_buffers(data);
-	pr_info("Katana PCM hw_free: URB buffers freed\n");
+	// URB buffers freed
 	
 	// Step 2: Deactivate the USB interface (process context - can sleep)
 	katana_set_interface_altsetting(data, 0);
@@ -833,7 +827,7 @@ int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			}
 		}
 		
-		pr_info("Katana PCM playback started with %d URBs\n", data->num_urbs);
+		// Playback started
 		break;
 		
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -953,11 +947,7 @@ static void katana_urb_complete(struct urb *urb)
 			period_elapsed = 1;
 		}
 		
-		// Log progress occasionally
-		if (urb_count % 50 == 0) {
-			pr_info("Katana URB success: transferred %u frames, hw_ptr=%u, period=%u\n", 
-				frames_transferred, data->hw_ptr, current_period);
-		}
+		// Progress tracking removed to reduce log noise
 		
 		spin_unlock_irqrestore(&data->lock, flags);
 		
@@ -969,10 +959,13 @@ static void katana_urb_complete(struct urb *urb)
 	case -ENOENT:
 	case -ECONNRESET:
 	case -ESHUTDOWN:
-		pr_info("Katana URB cancelled: status %d\n", urb->status);
+		// URB was cancelled - normal shutdown
 		goto exit_unlock;
 	default:
-		pr_info("Katana URB error: status %d\n", urb->status);
+		// URB error - log only serious errors
+		if (urb->status != -EPROTO && urb->status != -EILSEQ) {
+			pr_err("Katana URB error: status %d\n", urb->status);
+		}
 		goto exit_unlock;
 	}
 
@@ -1059,9 +1052,6 @@ static void katana_urb_complete(struct urb *urb)
 						memcpy(dest + first_part, pcm_buffer, second_part);
 					}
 					
-					// Apply volume control
-					apply_volume_control(dest, copy_size, data->format, data->channels);
-					
 					samples_copied += samples_to_copy;
 					
 					// Update actual packet length
@@ -1071,11 +1061,7 @@ static void katana_urb_complete(struct urb *urb)
 				// Update read pointer
 				data->read_ptr = (data->read_ptr + samples_copied) % data->buffer_size;
 				
-				// Debug logging
-				if (urb_count % 100 == 0) {
-					pr_info("Katana ISO: %u packets, %u samples each, %u total copied\n",
-						urb->number_of_packets, samples_per_packet, samples_copied);
-				}
+				// Debug logging removed to reduce noise
 			} else {
 				// Fill with silence
 				for (k = 0; k < urb->number_of_packets; k++) {
@@ -1115,7 +1101,6 @@ static void katana_urb_complete(struct urb *urb)
 					memcpy((char*)urb->transfer_buffer + first_part, pcm_buffer, second_part);
 				}
 				
-				apply_volume_control(urb->transfer_buffer, copy_size, data->format, data->channels);
 				data->read_ptr = (data->read_ptr + samples_needed) % data->buffer_size;
 				urb->transfer_buffer_length = copy_size;
 			} else {
@@ -1199,17 +1184,9 @@ static void katana_sync_urb_complete(struct urb *urb)
 				
 				spin_unlock_irqrestore(&data->lock, flags);
 				
-				// Log feedback occasionally
-				if (data->feedback_count % 100 == 0) {
-					pr_info("Katana feedback: raw=0x%06x, samples=%u, avg=%u (rate=%u)\n",
-						feedback_value, samples_per_frame, data->feedback_average, data->rate);
-				}
+				// Feedback logging removed to reduce log noise
 			} else {
-				// Invalid feedback - ignore but log
-				if (data->feedback_count % 50 == 0) {
-					pr_info("Katana feedback: invalid samples %u (expected %u-%u)\n", 
-						samples_per_frame, expected_min, expected_max);
-				}
+				// Invalid feedback - ignore (logging removed to reduce noise)
 			}
 		}
 		break;
@@ -1221,7 +1198,7 @@ static void katana_sync_urb_complete(struct urb *urb)
 		return;
 		
 	default:
-		pr_info("Katana sync URB error: status %d\n", urb->status);
+		// Sync URB error - logging removed to reduce noise
 		break;
 	}
 	
@@ -1234,126 +1211,7 @@ static void katana_sync_urb_complete(struct urb *urb)
 	}
 }
 
-// Apply volume control to audio data
-static void apply_volume_control(void *buffer, unsigned int buffer_size, 
-				 unsigned int format, unsigned int channels)
-{
-	int volume = katana_get_volume();
-	int mute = katana_get_mute();
-	unsigned int i;
-	static unsigned int volume_log_count = 0;
-	
-	volume_log_count++;
-	
-	// Log volume control state occasionally for debugging
-	if (volume_log_count % 100 == 0) {
-		pr_info("Katana Volume Control: volume=%d, mute=%d, format=%u, buffer_size=%u\n",
-			volume, mute, format, buffer_size);
-	}
-	
-	// In ALSA convention: 1 = unmuted, 0 = muted
-	// If muted (switch = 0), fill with silence
-	if (mute == 0) {
-		memset(buffer, 0, buffer_size);
-		if (volume_log_count % 100 == 0) {
-			pr_info("Katana Volume Control: Audio muted - filling with silence\n");
-		}
-		return;
-	}
-	
-	// If volume is 100%, no need to modify data
-	if (volume >= 100) {
-		if (volume_log_count % 100 == 0) {
-			pr_info("Katana Volume Control: Volume at 100%%, no scaling applied\n");
-		}
-		return;
-	}
-	
-	// Apply volume scaling based on format
-	switch (format) {
-	case SNDRV_PCM_FORMAT_S16_LE:
-		{
-			int16_t *samples = (int16_t *)buffer;
-			unsigned int num_samples = buffer_size / sizeof(int16_t);
-			
-			for (i = 0; i < num_samples; i++) {
-				// Scale by volume percentage - NO SAFETY ATTENUATION TO TEST
-				int32_t scaled = (int32_t)samples[i] * volume / 100;
-				
-				// Clamp to avoid overflow
-				if (scaled > 32767) scaled = 32767;
-				if (scaled < -32768) scaled = -32768;
-				
-				samples[i] = (int16_t)scaled;
-			}
-			
-			if (volume_log_count % 100 == 0) {
-				pr_info("Katana Volume Control: Applied S16_LE scaling, volume=%d%%\n", volume);
-			}
-		}
-		break;
-		
-	case SNDRV_PCM_FORMAT_S24_3LE:
-		{
-			uint8_t *bytes = (uint8_t *)buffer;
-			unsigned int num_samples = buffer_size / 3; // 3 bytes per sample
-			
-			for (i = 0; i < num_samples; i++) {
-				// Extract 24-bit sample (little endian)
-				int32_t sample = (bytes[i*3] | (bytes[i*3+1] << 8) | (bytes[i*3+2] << 16));
-				
-				// Sign extend from 24 to 32 bits
-				if (sample & 0x800000) {
-					sample |= 0xFF000000;
-				}
-				
-				// Scale by volume percentage - NO SAFETY ATTENUATION TO TEST
-				int64_t scaled = (int64_t)sample * volume / 100;
-				
-				// Clamp to 24-bit range
-				if (scaled > 8388607) scaled = 8388607;
-				if (scaled < -8388608) scaled = -8388608;
-				
-				// Store back as 24-bit little endian
-				bytes[i*3] = (uint8_t)(scaled & 0xFF);
-				bytes[i*3+1] = (uint8_t)((scaled >> 8) & 0xFF);
-				bytes[i*3+2] = (uint8_t)((scaled >> 16) & 0xFF);
-			}
-			
-			if (volume_log_count % 100 == 0) {
-				pr_info("Katana Volume Control: Applied S24_3LE scaling, volume=%d%%\n", volume);
-			}
-		}
-		break;
-		
-	case SNDRV_PCM_FORMAT_S32_LE:
-		{
-			int32_t *samples = (int32_t *)buffer;
-			unsigned int num_samples = buffer_size / sizeof(int32_t);
-			
-			for (i = 0; i < num_samples; i++) {
-				// Scale by volume percentage - NO SAFETY ATTENUATION TO TEST
-				int64_t scaled = (int64_t)samples[i] * volume / 100;
-				
-				// Clamp to avoid overflow
-				if (scaled > 2147483647LL) scaled = 2147483647LL;
-				if (scaled < -2147483648LL) scaled = -2147483648LL;
-				
-				samples[i] = (int32_t)scaled;
-			}
-			
-			if (volume_log_count % 100 == 0) {
-				pr_info("Katana Volume Control: Applied S32_LE scaling, volume=%d%%\n", volume);
-			}
-		}
-		break;
-		
-	default:
-		// Unknown format, no processing
-		pr_warn("Katana PCM: Unknown format %u, no volume scaling applied\n", format);
-		break;
-	}
-}
+
 
 // Allocate URB buffers for USB audio streaming
 static int katana_alloc_urb_buffers(struct katana_pcm_data *data)
@@ -1406,13 +1264,9 @@ static int katana_alloc_urb_buffers(struct katana_pcm_data *data)
 	if (usb_endpoint_is_bulk_out(ep_desc)) {
 		is_isoc_endpoint = 0;
 		max_packet_size = le16_to_cpu(ep_desc->wMaxPacketSize);
-		pr_info("Katana PCM: Setting up bulk URBs for endpoint 0x%02x (max_packet=%u)\n", 
-			data->endpoint_out, max_packet_size);
 	} else if (usb_endpoint_is_isoc_out(ep_desc)) {
 		is_isoc_endpoint = 1;
 		max_packet_size = le16_to_cpu(ep_desc->wMaxPacketSize);
-		pr_info("Katana PCM: Setting up isochronous URBs for endpoint 0x%02x (max_packet=%u)\n", 
-			data->endpoint_out, max_packet_size);
 	} else {
 		pr_err("Katana PCM: Endpoint 0x%02x is not a valid OUT endpoint\n", data->endpoint_out);
 		return -ENODEV;
@@ -1467,8 +1321,7 @@ static int katana_alloc_urb_buffers(struct katana_pcm_data *data)
 	data->sync_urb->transfer_dma = data->sync_dma_addr;
 	data->sync_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 	
-	pr_info("Katana PCM: Allocated sync URB for endpoint 0x%02x (%u bytes)\n",
-		data->endpoint_sync, data->sync_packet_size);
+	// Sync URB allocated successfully
 	
 	// Calculate optimal packet structure for isochronous transfers
 	unsigned int packets_per_urb = 8;  // 8ms worth of packets per URB
@@ -1489,8 +1342,7 @@ static int katana_alloc_urb_buffers(struct katana_pcm_data *data)
 		goto error_cleanup;
 	}
 	
-	pr_info("Katana PCM: Isochronous setup: %u packets per URB, %u samples per packet, %u bytes per packet\n",
-		packets_per_urb, nominal_samples_per_packet, nominal_packet_size);
+	// Isochronous setup complete
 	
 	// Allocate URBs and their buffers
 	for (i = 0; i < data->num_urbs; i++) {
@@ -1531,8 +1383,7 @@ static int katana_alloc_urb_buffers(struct katana_pcm_data *data)
 				data->urbs[i]->iso_frame_desc[j].length = nominal_packet_size;
 			}
 			
-			pr_info("Katana PCM: URB %d: isochronous transfer with %u packets of %u bytes each\n", 
-				i, packets_per_urb, nominal_packet_size);
+			// Isochronous URB configured
 		} else {
 			// Use bulk URB for bulk endpoint
 			usb_fill_bulk_urb(data->urbs[i], data->usb_dev,
@@ -1542,8 +1393,7 @@ static int katana_alloc_urb_buffers(struct katana_pcm_data *data)
 					  katana_urb_complete,
 					  data);
 			
-			pr_info("Katana PCM: URB %d: bulk transfer of %u bytes\n", 
-				i, urb_buffer_size);
+			// Bulk URB configured
 		}
 		
 		data->urbs[i]->transfer_dma = data->urb_dma_addrs[i];

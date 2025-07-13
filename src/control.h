@@ -14,7 +14,3 @@ int katana_volume_info(struct snd_kcontrol *kctl, struct snd_ctl_elem_info *uinf
 int katana_mute_get(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol);
 int katana_mute_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol);
 int katana_mute_info(struct snd_kcontrol *kctl, struct snd_ctl_elem_info *uinfo);
-
-// Getter functions for PCM module
-int katana_get_volume(void);
-int katana_get_mute(void);
