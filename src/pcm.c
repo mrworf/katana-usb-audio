@@ -429,7 +429,7 @@ int katana_pcm_playback_open(struct snd_pcm_substream *substream)
 			    katana_buffer_constraint, NULL,
 			    SNDRV_PCM_HW_PARAM_PERIOD_BYTES, SNDRV_PCM_HW_PARAM_PERIODS, -1);
 
-	pr_info("Katana PCM playback opened\n");
+
 	katana_exit_operation();
 	return 0;
 }
@@ -442,13 +442,9 @@ void katana_pcm_invalidate_usb_dev(struct snd_card *card)
 		return;
 	}
 	
-	pr_info("Katana PCM: Invalidating USB device references for card disconnect\n");
-	
 	// Mark all PCM private data as having invalid USB devices
 	// This prevents further USB operations but allows buffer cleanup to continue
 	// The individual PCM operations will handle the invalid USB device gracefully
-	
-	pr_info("Katana PCM: USB device invalidation complete - operations will be blocked\n");
 }
 
 // Close playback substream
@@ -460,8 +456,6 @@ int katana_pcm_playback_close(struct snd_pcm_substream *substream)
 	// We always need to be able to clean up resources
 
 	if (data) {
-		pr_info("Katana PCM close: Cleaning up private data\n");
-		
 		// Stop streaming and free URB buffers
 		data->stream_started = 0;
 		katana_free_urb_buffers(data);
@@ -469,8 +463,6 @@ int katana_pcm_playback_close(struct snd_pcm_substream *substream)
 		kfree(data);
 		substream->runtime->private_data = NULL;  // CRITICAL: Clear dangling pointer
 	}
-
-	pr_info("Katana PCM playback closed\n");
 	return 0;
 }
 
@@ -514,16 +506,8 @@ int katana_pcm_hw_params(struct snd_pcm_substream *substream,
 	buffer_bytes = params_buffer_bytes(hw_params);
 	periods = params_periods(hw_params);
 
-	pr_info("Katana PCM hw_params: format=%u (%s), channels=%u, rate=%u\n", 
-		data->format, 
-		(data->format == SNDRV_PCM_FORMAT_S24_3LE) ? "S24_3LE" :
-		(data->format == SNDRV_PCM_FORMAT_S32_LE) ? "S32_LE" :
-		(data->format == SNDRV_PCM_FORMAT_S16_LE) ? "S16_LE" : "UNKNOWN",
-		data->channels, data->rate);
-
 	// Calculate frame size based on format
 	unsigned int frame_size = data->channels * snd_pcm_format_physical_width(data->format) / 8;
-	pr_info("Katana PCM hw_params: Calculated frame_size=%u bytes per frame\n", frame_size);
 	
 	// Verify frame size matches expected values
 	if (data->format == SNDRV_PCM_FORMAT_S24_3LE && data->channels == 2) {
@@ -541,9 +525,7 @@ int katana_pcm_hw_params(struct snd_pcm_substream *substream,
 		katana_exit_operation();
 		return -EINVAL;
 	}
-	
-	pr_info("Katana PCM hw_params: period_size=%u frames, period_bytes=%u bytes, buffer_size=%u frames\n",
-		data->period_size, data->period_bytes, data->buffer_size);
+
 
 	// CRITICAL: Validate that buffer_bytes = period_bytes * periods
 	if (buffer_bytes != data->period_bytes * periods) {
@@ -563,8 +545,7 @@ int katana_pcm_hw_params(struct snd_pcm_substream *substream,
 		return -EINVAL;
 	}
 
-	pr_info("Katana PCM hw_params: Setting buffer_bytes=%zu for rate=%d, channels=%d, format=%d\n",
-		buffer_bytes, data->rate, data->channels, data->format);
+
 
 	// **DUAL-BUFFER APPROACH FOR USB AUDIO**
 	
@@ -576,8 +557,7 @@ int katana_pcm_hw_params(struct snd_pcm_substream *substream,
 		return err;
 	}
 
-	pr_info("Katana PCM: ALSA buffer allocated successfully - dma_area=%p dma_bytes=%zu\n", 
-		substream->runtime->dma_area, substream->runtime->dma_bytes);
+
 
 	// Step 2: Free existing URB buffers if any
 	katana_free_urb_buffers(data);
@@ -626,8 +606,6 @@ int katana_pcm_hw_free(struct snd_pcm_substream *substream)
 		goto cleanup_runtime;
 	}
 	
-	pr_info("Katana PCM hw_free: Starting buffer cleanup\n");
-	
 	// **DUAL-BUFFER CLEANUP FOR USB AUDIO**
 	
 	// Step 1: Stop streaming and free URB buffers
@@ -637,14 +615,11 @@ int katana_pcm_hw_free(struct snd_pcm_substream *substream)
 	
 	// Step 2: Deactivate the USB interface (process context - can sleep)
 	katana_set_interface_altsetting(data, 0);
-	pr_info("Katana PCM hw_free: Interface deactivated\n");
 	
 	// Step 3: Free ALSA PCM buffer
 	snd_pcm_lib_free_pages(substream);
-	pr_info("Katana PCM hw_free: ALSA buffer freed\n");
 	
 cleanup_runtime:
-	pr_info("Katana PCM hw_free: Cleanup complete\n");
 	return 0;
 }
 
@@ -717,8 +692,7 @@ int katana_pcm_prepare(struct snd_pcm_substream *substream)
 		return err;
 	}
 
-	pr_info("Katana PCM prepared for playback at %u Hz (altsetting %d)\n", 
-		data->rate, target_altsetting);
+
 	katana_exit_operation();
 	return 0;
 }
@@ -842,17 +816,14 @@ int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			usb_unlink_urb(data->urbs[i]);
 		}
 		
-		pr_info("Katana PCM playback stopped\n");
 		break;
 		
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		data->running = 0;
-		pr_info("Katana PCM playback paused\n");
 		break;
 		
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		data->running = 1;
-		pr_info("Katana PCM playback resumed\n");
 		break;
 		
 	default:

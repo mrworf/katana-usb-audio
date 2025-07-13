@@ -78,8 +78,6 @@ static int katana_usb_probe(struct usb_interface *iface, const struct usb_device
 		This function is called for each interface of the matching device.
 		Return SUCCESS for the AudioControl interface only.
 	*/
-	pr_info("======= KATANA PROBE =======\n");
-
 	// Map the device's interface to the device itself and get its data
 	struct usb_device *dev = interface_to_usbdev(iface);
 
@@ -204,7 +202,7 @@ static void katana_usb_disconnect(struct usb_interface *iface)
 	struct usb_device *dev = interface_to_usbdev(iface);
 	
 	if (card) {
-		pr_info("Katana USB: Disconnecting device, setting disconnect flag\n");
+	
 		
 		// Step 1: Set disconnect flag to block new operations
 		atomic_set(&disconnect_in_progress, 1);
@@ -216,9 +214,6 @@ static void katana_usb_disconnect(struct usb_interface *iface)
 		// Step 3: Wait for all active operations to complete
 		// Check if there are any active operations
 		if (atomic_read(&active_operations) > 0) {
-			pr_info("Katana USB: Waiting for %d active operations to complete\n", 
-				atomic_read(&active_operations));
-			
 			// Re-initialize completion for this disconnect
 			reinit_completion(&disconnect_completion);
 			
@@ -227,8 +222,6 @@ static void katana_usb_disconnect(struct usb_interface *iface)
 								   msecs_to_jiffies(10000));
 			if (timeout == 0) {
 				pr_warn("Katana USB: Timeout waiting for operations to complete, forcing disconnect\n");
-			} else {
-				pr_info("Katana USB: All operations completed, proceeding with disconnect\n");
 			}
 		}
 		

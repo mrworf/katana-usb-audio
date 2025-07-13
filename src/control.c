@@ -46,7 +46,6 @@ static int katana_get_volume_range(struct usb_device *usb_dev, int16_t *min_vol,
 	
 	if (err >= 0) {
 		*min_vol = volume_data[0] | (volume_data[1] << 8);
-		pr_info("Katana Control: Volume MIN = %d (0x%04x)\n", *min_vol, (uint16_t)*min_vol);
 	} else {
 		pr_warn("Katana Control: Failed to get volume MIN: %d\n", err);
 		*min_vol = -20480; // fallback
@@ -65,7 +64,6 @@ static int katana_get_volume_range(struct usb_device *usb_dev, int16_t *min_vol,
 	
 	if (err >= 0) {
 		*max_vol = volume_data[0] | (volume_data[1] << 8);
-		pr_info("Katana Control: Volume MAX = %d (0x%04x)\n", *max_vol, (uint16_t)*max_vol);
 	} else {
 		pr_warn("Katana Control: Failed to get volume MAX: %d\n", err);
 		*max_vol = 0; // fallback
@@ -84,7 +82,6 @@ static int katana_get_volume_range(struct usb_device *usb_dev, int16_t *min_vol,
 	
 	if (err >= 0) {
 		*res_vol = volume_data[0] | (volume_data[1] << 8);
-		pr_info("Katana Control: Volume RES = %d (0x%04x)\n", *res_vol, (uint16_t)*res_vol);
 	} else {
 		pr_warn("Katana Control: Failed to get volume RES: %d\n", err);
 		*res_vol = 1; // fallback
@@ -95,6 +92,9 @@ static int katana_get_volume_range(struct usb_device *usb_dev, int16_t *min_vol,
 	katana_vol_max = *max_vol;
 	katana_vol_res = *res_vol;
 	katana_vol_range_initialized = 1;
+	
+	pr_info("Katana Control: Volume range initialized - MIN: %d, MAX: %d, RES: %d\n", 
+		*min_vol, *max_vol, *res_vol);
 	
 	usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
 	return 0;
@@ -110,7 +110,6 @@ static int katana_set_hardware_volume_raw(struct usb_device *usb_dev, int16_t vo
 	// Initialize volume range if not done already
 	if (!katana_vol_range_initialized) {
 		int16_t min_vol, max_vol, res_vol;
-		pr_info("Katana Control: Initializing volume range...\n");
 		katana_get_volume_range(usb_dev, &min_vol, &max_vol, &res_vol);
 	}
 	
@@ -164,109 +163,11 @@ static int katana_set_hardware_volume_raw(struct usb_device *usb_dev, int16_t vo
 		return err;
 	}
 	
-	pr_info("Katana Control: Set raw hardware volume to %d (0x%04x)\n", volume_value, (uint16_t)volume_value);
-	
 	usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
 	return 0;
 }
 
-// USB Audio Class hardware volume control functions (legacy percentage interface)
-static int katana_set_hardware_volume(struct usb_device *usb_dev, int volume_percent)
-{
-	int err;
-	unsigned char *volume_data;
-	dma_addr_t dma_addr;
-	
-	// Initialize volume range if not done already
-	if (!katana_vol_range_initialized) {
-		int16_t min_vol, max_vol, res_vol;
-		pr_info("Katana Control: Initializing volume range...\n");
-		katana_get_volume_range(usb_dev, &min_vol, &max_vol, &res_vol);
-	}
-	
-	// Allocate USB coherent memory for control transfer
-	volume_data = usb_alloc_coherent(usb_dev, 2, GFP_KERNEL, &dma_addr);
-	if (!volume_data) {
-		pr_err("Katana Control: Failed to allocate coherent memory for volume control\n");
-		return -ENOMEM;
-	}
-	
-	// Convert percentage (0-100) to 16-bit signed volume value using device range
-	int16_t volume_value;
-	
-	if (volume_percent <= 0) {
-		volume_value = katana_vol_min;
-	} else if (volume_percent >= 100) {
-		volume_value = katana_vol_max;
-	} else {
-		// Linear scaling from min to max using device range
-		int32_t raw_value = katana_vol_min + (volume_percent * (katana_vol_max - katana_vol_min)) / 100;
-		
-		// Quantize to device resolution (steps of katana_vol_res)
-		if (katana_vol_res > 1) {
-			// Round to nearest multiple of resolution
-			int32_t steps = (raw_value - katana_vol_min + katana_vol_res/2) / katana_vol_res;
-			volume_value = katana_vol_min + (steps * katana_vol_res);
-		} else {
-			volume_value = raw_value;
-		}
-	}
-	
-	// Pack volume value into 2-byte little-endian format
-	volume_data[0] = volume_value & 0xff;
-	volume_data[1] = (volume_value >> 8) & 0xff;
-	
-	// Send SET_CUR request for volume control
-	// USB Audio Class 1.0 specification: SET_CUR request for Feature Unit
-	// bmRequestType: 0x21 = Class request, Interface recipient, Host-to-device
-	// bRequest: 0x01 = SET_CUR
-	// wValue: (0x02 << 8) | 0x01 = Volume Control (0x02) on channel 1 (left)
-	// wIndex: 0x0100 = Interface 0, Feature Unit ID 1 (speaker output)
-	err = usb_control_msg(usb_dev,
-			      usb_sndctrlpipe(usb_dev, 0),
-			      0x01,  // SET_CUR
-			      0x21,  // bmRequestType
-			      0x0201, // wValue: Volume Control, channel 1
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      volume_data,
-			      2,     // 2 bytes for volume
-			      1000); // timeout
-	
-	if (err < 0) {
-		pr_err("Katana Control: Failed to set hardware volume %d%%: %d\n", volume_percent, err);
-		usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
-		return err;
-	}
-	
-	// Also set right channel (channel 2)
-	err = usb_control_msg(usb_dev,
-			      usb_sndctrlpipe(usb_dev, 0),
-			      0x01,  // SET_CUR
-			      0x21,  // bmRequestType
-			      0x0202, // wValue: Volume Control, channel 2
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      volume_data,
-			      2,     // 2 bytes for volume
-			      1000); // timeout
-	
-	if (err < 0) {
-		pr_err("Katana Control: Failed to set hardware volume right channel %d%%: %d\n", volume_percent, err);
-		usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
-		return err;
-	}
-	
-	pr_info("Katana Control: Set hardware volume to %d%% (0x%04x) [range: %d to %d, res: %d]\n", 
-		volume_percent, (uint16_t)volume_value, katana_vol_min, katana_vol_max, katana_vol_res);
-	
-	// If setting a non-zero volume, try to unmute the device
-	if (volume_percent > 0) {
-		pr_info("Katana Control: Auto-unmuting device for non-zero volume\n");
-		katana_set_hardware_mute(usb_dev, 0); // unmute
-	}
-	
-	usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
-	return 0;
-}
+// Removed unused percentage-based volume control function
 
 // Get raw hardware volume value (not percentage)
 static int16_t katana_get_hardware_volume_raw(struct usb_device *usb_dev)
@@ -278,7 +179,6 @@ static int16_t katana_get_hardware_volume_raw(struct usb_device *usb_dev)
 	// Initialize volume range if not done already
 	if (!katana_vol_range_initialized) {
 		int16_t min_vol, max_vol, res_vol;
-		pr_info("Katana Control: Initializing volume range...\n");
 		katana_get_volume_range(usb_dev, &min_vol, &max_vol, &res_vol);
 	}
 	
@@ -314,73 +214,14 @@ static int16_t katana_get_hardware_volume_raw(struct usb_device *usb_dev)
 	// Return raw 16-bit signed volume value
 	int16_t volume_value = volume_data[0] | (volume_data[1] << 8);
 	
-	pr_info("Katana Control: Got raw hardware volume 0x%04x (%d)\n", 
+	pr_debug("Katana Control: Got raw hardware volume 0x%04x (%d)\n", 
 		(uint16_t)volume_value, volume_value);
 	usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
 	return volume_value;
 }
 
 // Get hardware volume using USB Audio Class control requests (returns percentage)
-static int katana_get_hardware_volume(struct usb_device *usb_dev)
-{
-	int err;
-	unsigned char *volume_data;
-	dma_addr_t dma_addr;
-	int volume_percent;
-	
-	// Initialize volume range if not done already
-	if (!katana_vol_range_initialized) {
-		int16_t min_vol, max_vol, res_vol;
-		pr_info("Katana Control: Initializing volume range...\n");
-		katana_get_volume_range(usb_dev, &min_vol, &max_vol, &res_vol);
-	}
-	
-	// Allocate USB coherent memory for control transfer
-	volume_data = usb_alloc_coherent(usb_dev, 2, GFP_KERNEL, &dma_addr);
-	if (!volume_data) {
-		pr_err("Katana Control: Failed to allocate coherent memory for volume control\n");
-		return -1;
-	}
-	
-	// Send GET_CUR request for volume control
-	// USB Audio Class 1.0 specification: GET_CUR request for Feature Unit
-	// bmRequestType: 0xA1 = Class request, Interface recipient, Device-to-host
-	// bRequest: 0x81 = GET_CUR
-	// wValue: (0x02 << 8) | 0x01 = Volume Control (0x02) on channel 1 (left)
-	// wIndex: 0x0100 = Interface 0, Feature Unit ID 1 (speaker output)
-	err = usb_control_msg(usb_dev,
-			      usb_rcvctrlpipe(usb_dev, 0),
-			      0x81,  // GET_CUR
-			      0xA1,  // bmRequestType
-			      0x0201, // wValue: Volume Control, channel 1
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      volume_data,
-			      2,     // 2 bytes for volume
-			      1000); // timeout
-	
-	if (err < 0) {
-		pr_err("Katana Control: Failed to get hardware volume: %d\n", err);
-		usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
-		return -1; // Return error as negative value
-	}
-	
-	// Convert from 16-bit signed volume value to percentage using device range
-	int16_t volume_value = volume_data[0] | (volume_data[1] << 8);
-	
-	if (volume_value <= katana_vol_min) {
-		volume_percent = 0; // Minimum volume
-	} else if (volume_value >= katana_vol_max) {
-		volume_percent = 100; // Maximum volume
-	} else {
-		// Linear scaling from min to max using device range
-		volume_percent = ((volume_value - katana_vol_min) * 100) / (katana_vol_max - katana_vol_min);
-	}
-	
-	pr_info("Katana Control: Got hardware volume %d%% (0x%04x) [raw: %d, range: %d to %d]\n", 
-		volume_percent, (uint16_t)volume_value, volume_value, katana_vol_min, katana_vol_max);
-	usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
-	return volume_percent;
-}
+// Removed unused percentage-based volume get function
 
 // Set hardware mute using USB Audio Class control requests
 static int katana_set_hardware_mute(struct usb_device *usb_dev, int mute)
@@ -421,7 +262,6 @@ static int katana_set_hardware_mute(struct usb_device *usb_dev, int mute)
 		return err;
 	}
 	
-	pr_info("Katana Control: Set hardware mute to %s (sent %d to device)\n", mute ? "ON" : "OFF", mute_data[0]);
 	usb_free_coherent(usb_dev, 1, mute_data, dma_addr);
 	return 0;
 }
@@ -466,7 +306,6 @@ static int katana_get_hardware_mute(struct usb_device *usb_dev)
 	// Return mute state: device uses inverted logic (0 = muted, 1 = unmuted)
 	// Convert to ALSA standard: 1 = muted, 0 = unmuted
 	mute = mute_data[0] ? 0 : 1;
-	pr_info("Katana Control: Got hardware mute %s (device returned %d)\n", mute ? "ON" : "OFF", mute_data[0]);
 	usb_free_coherent(usb_dev, 1, mute_data, dma_addr);
 	return mute;
 }
@@ -512,12 +351,9 @@ int katana_volume_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucon
 		return 0;
 	}
 	
-	pr_info("Katana Control: Setting volume to %ld steps\n", ucontrol->value.integer.value[0]);
-	
 	// Initialize volume range if not done already
 	if (!katana_vol_range_initialized) {
 		int16_t min_vol, max_vol, res_vol;
-		pr_info("Katana Control: Initializing volume range...\n");
 		katana_get_volume_range(usb_dev, &min_vol, &max_vol, &res_vol);
 	}
 	
@@ -532,8 +368,6 @@ int katana_volume_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucon
 	
 	int err = katana_set_hardware_volume_raw(usb_dev, raw_volume);
 	
-	pr_info("Katana Control: Volume set to %d steps -> raw %d (0x%04x) (result: %d)\n", 
-		alsa_steps, raw_volume, (uint16_t)raw_volume, err);
 	return (err == 0) ? 1 : 0; // Return 1 if changed successfully
 }
 
@@ -553,7 +387,6 @@ int katana_volume_info(struct snd_kcontrol *kctl, struct snd_ctl_elem_info *uinf
 		struct usb_device *usb_dev = get_usb_device_from_control(kctl);
 		if (usb_dev) {
 			int16_t min_vol, max_vol, res_vol;
-			pr_info("Katana Control: Initializing volume range for ALSA info...\n");
 			katana_get_volume_range(usb_dev, &min_vol, &max_vol, &res_vol);
 		}
 	}
@@ -567,9 +400,6 @@ int katana_volume_info(struct snd_kcontrol *kctl, struct snd_ctl_elem_info *uinf
 	uinfo->value.integer.min = 0;
 	uinfo->value.integer.max = steps;
 	
-	pr_info("Katana Control: ALSA volume range: 0 to %d steps (device: %d to %d, res: %d)\n",
-		steps, katana_vol_min, katana_vol_max, katana_vol_res);
-
 	return 0;
 }
 
@@ -601,11 +431,8 @@ int katana_mute_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontr
 	
 	int new_mute = ucontrol->value.integer.value[0];
 	
-	pr_info("Katana Control: Setting mute to %d\n", new_mute);
-	
 	int err = katana_set_hardware_mute(usb_dev, new_mute);
 	
-	pr_info("Katana Control: Mute set to %d (result: %d)\n", new_mute, err);
 	return (err == 0) ? 1 : 0; // Return 1 if changed successfully
 }
 
