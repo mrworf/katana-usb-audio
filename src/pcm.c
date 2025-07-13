@@ -183,7 +183,7 @@ static int katana_find_audio_endpoint(struct katana_pcm_data *data)
 			if (usb_endpoint_is_bulk_out(ep_desc) || usb_endpoint_is_isoc_out(ep_desc)) {
 				data->endpoint_out = ep_desc->bEndpointAddress;
 				data->altsetting_num = altsetting->desc.bAlternateSetting;
-				pr_info("Katana PCM: Found audio data endpoint: 0x%02x (altsetting %d, 48kHz)\n",
+				pr_debug("Katana PCM: Found audio data endpoint: 0x%02x (altsetting %d, 48kHz)\n",
 					data->endpoint_out, data->altsetting_num);
 			}
 			
@@ -191,14 +191,14 @@ static int katana_find_audio_endpoint(struct katana_pcm_data *data)
 			if (usb_endpoint_is_isoc_in(ep_desc)) {
 				data->endpoint_sync = ep_desc->bEndpointAddress;
 				data->sync_packet_size = le16_to_cpu(ep_desc->wMaxPacketSize);
-				pr_info("Katana PCM: Found sync feedback endpoint: 0x%02x (packet size %u)\n",
+				pr_debug("Katana PCM: Found sync feedback endpoint: 0x%02x (packet size %u)\n",
 					data->endpoint_sync, data->sync_packet_size);
 			}
 		}
 		
 		// We need both endpoints for proper operation
 		if (data->endpoint_out && data->endpoint_sync) {
-			pr_info("Katana PCM: Found both data (0x%02x) and sync (0x%02x) endpoints in altsetting %d\n",
+			pr_debug("Katana PCM: Found both data (0x%02x) and sync (0x%02x) endpoints in altsetting %d\n",
 				data->endpoint_out, data->endpoint_sync, data->altsetting_num);
 			return 0;
 		}
@@ -225,7 +225,7 @@ static int katana_set_interface_altsetting(struct katana_pcm_data *data, int alt
 		return err;
 	}
 	
-	pr_info("Katana PCM: Set interface %d to altsetting %d\n", AUDIO_STREAM_IFACE_ID, altsetting);
+	pr_debug("Katana PCM: Set interface %d to altsetting %d\n", AUDIO_STREAM_IFACE_ID, altsetting);
 	return 0;
 }
 
@@ -261,7 +261,7 @@ static int katana_set_sample_rate(struct katana_pcm_data *data, unsigned int rat
 		return err;
 	}
 	
-	pr_info("Katana PCM: Set sample rate to %u Hz\n", rate);
+	pr_debug("Katana PCM: Set sample rate to %u Hz\n", rate);
 	return 0;
 }
 
@@ -289,14 +289,14 @@ int katana_pcm_new(struct snd_card *card, struct snd_pcm **pcm_ret)
 	struct snd_pcm *pcm;
 	int err;
 
-	err = snd_pcm_new(card, "Katana USB Audio", 0, 1, 0, &pcm);
+	err = snd_pcm_new(card, "SoundBlaster X Katana", 0, 1, 0, &pcm);
 	if (err < 0)
 		return err;
 
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &katana_pcm_playback_ops);
 	pcm->private_data = card;
 	pcm->info_flags = 0;
-	strcpy(pcm->name, "Katana USB Audio");
+	strcpy(pcm->name, "SoundBlaster X Katana");
 
 	// Set up DMA buffer management for ALSA PCM layer
 	// We use vmalloc-backed memory for the PCM buffer since we'll

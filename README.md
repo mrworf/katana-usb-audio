@@ -1,21 +1,61 @@
-# SoundBlasterX Katana (Linux Kernel Module) audio control driver
+# SoundBlasterX Katana Linux USB Audio Driver
 
-First attempt at implementing the ALSA driver in order to finally get my SoundBlaster X Katana (USB) loudspeaker be handled properly under Linux and to learn how the Linux kernel-space drivers work. This module uses the ALSA and the USB core framework. Because of its educational purpose, there are a lot of comments in the code, which are most most probably not necessary for more experienced driver developers.
+A specialized Linux kernel driver for the Creative SoundBlaster X Katana USB speaker system. This driver provides full ALSA integration with proper volume controls and audio streaming, replacing the limited functionality of the generic snd-usb-audio driver.
 
-**Current state of the project**: The USB driver is attached to the Katana device successfully. It creates an ALSA card structure with proper PCM playback support and volume/mute controls. The driver is now visible in PulseAudio and KDE's audio settings, allowing for volume control, muting, and audio playback.
+**Current state**: Full functionality including USB audio streaming, hardware volume controls, mute functionality, and proper ALSA integration.
 
 ## Features
 
-- ✅ USB device detection and attachment
-- ✅ ALSA sound card creation
-- ✅ PCM playback device with proper audio streaming support
-- ✅ Volume control (0-100%)
-- ✅ Mute/unmute control
-- ✅ PulseAudio integration
-- ✅ KDE audio device detection
-- ✅ Multiple audio format support (S16_LE, S24_LE, S32_LE)
-- ✅ Multiple sample rate support (8kHz - 96kHz)
+- ✅ Hardware volume control with mute/unmute control
+- ✅ PulseAudio/PipeWire integration
+- ✅ Proper audio format support
 - ✅ Stereo output (2 channels)
+- ✅ Automatic driver priority over snd-usb-audio using udev rules
+
+
+## Credit
+
+All this work was inspired by [Print3M](https://github.com/Print3M) who created [pyusb-katana-driver](https://github.com/Print3M/pyusb-katana-driver) and later [katana-usb-audio](https://github.com/Print3M/katana-usb-audio) which inspired me. 
+
+While Linux's default `snd-usb-audio` "works" with Katana, you aren't able to leverage the hardware audio control, and the buttons on the soundbar would both change the hardware amp (because of the direct connection) and send USB HID events (essentially keypresses) emulating volume up/down. 
+
+The lack of working hardware buttons wasn't really a big issue, but the fact that the hardware amplifier wasn't being control by Linux would cause quite the frustration. 
+
+## Installation
+
+### Quick Install (Recommended)
+```bash
+make
+sudo make install
+```
+
+This will:
+- Build the kernel module
+- Install it to `/lib/modules/$(uname -r)/extra/`
+- Install udev rules for driver priority
+- Update module dependencies
+
+### Manual Installation
+```bash
+make                                # Build the kernel module
+sudo insmod katana_usb_audio.ko     # Load module manually
+sudo lsmod | grep katana            # Check if loaded
+```
+
+### Loading the Driver
+```bash
+# If snd-usb-audio is already loaded for the Katana:
+sudo modprobe -r snd_usb_audio
+sudo modprobe katana_usb_audio
+
+# Or simply:
+sudo modprobe katana_usb_audio
+```
+
+### Uninstalling
+```bash
+sudo make uninstall
+```
 
 ## Usage
 
@@ -23,27 +63,10 @@ First attempt at implementing the ALSA driver in order to finally get my SoundBl
 make                                # Build the kernel module
 sudo insmod katana_usb_audio.ko     # Load module
 sudo lsmod | grep katana            # Check if loaded
-./test_audio.sh                     # Run comprehensive tests
 make clean                          # Clean build files
 sudo rmmod katana_usb_audio         # Remove module
 sudo dmesg                          # Read kernel logs
 ```
-
-## Testing
-
-Run the included test script to verify all functionality:
-
-```bash
-./test_audio.sh
-```
-
-This will:
-1. Check if the driver is loaded
-2. Verify ALSA device detection
-3. Check PulseAudio integration
-4. Test volume control
-5. Test mute control
-6. Attempt audio playback
 
 ## Audio Controls
 
@@ -61,6 +84,12 @@ amixer -c katana-usb-audio sset "PCM Playback Switch" off
 amixer -c katana-usb-audio sset "PCM Playback Switch" on
 ```
 
+### Volume resolution
+
+While the Katana shows volumes as "absolutes" ranging from 0 to 50, they're inversely logarithmic, meaning that when alsa makes volume changes in the lower range, the visual indicator on the bar may not change. This is different from Windows and MacOS where the mapping is done based on the USB device's scale, with the drawback of poor granular control at low volumes.
+
+I've not attempted to solve this, since I've often been frustrated with the lack of control at low levels.
+
 ## PulseAudio Integration
 
 The driver is automatically detected by PulseAudio and will appear in:
@@ -70,7 +99,7 @@ The driver is automatically detected by PulseAudio and will appear in:
 
 ## Troubleshooting
 
-> **NOTICE**: Sometimes the Linux kernel stubbornly probes the `snd-usb-audio` driver first. Manual removal of this default driver might be helpful (`sudo rmmod snd-usb-audio`). It will be loaded anyway but most probably after probing of this custom driver.
+If it doesn't seem to work properly, use `lsusb` and `lsusb -t` to see what driver is powering the katana. If it states `snd-usb-audio`, you've most likely not installed the udev rule and rebooted.
 
 ### Common Issues
 
@@ -86,23 +115,3 @@ All driver logs can be seen using the `dmesg` command. The driver provides detai
 - Audio control operations
 - Playback state changes
 
-## Technical Details
-
-### Supported Audio Formats
-- Sample rates: 8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000 Hz
-- Formats: S16_LE, S24_LE, S32_LE
-- Channels: 2 (stereo)
-- Buffer size: Up to 32KB
-- Periods: 2-8
-
-### USB Interface Handling
-- **Interface 0**: Audio Control (volume, mute controls)
-- **Interface 1**: Audio Streaming (PCM playback)
-
-## Resources to write USB driver
-
-* [O'Reilly, USB Drivers](https://www.oreilly.com/library/view/linux-device-drivers/0596005903/ch13.html)
-* [Linux Kernel docs - Writing USB Device Drivers](https://docs.kernel.org/driver-api/usb/writing_usb_driver.html)
-* [Linux Kernel docs - USB Host Side API](https://www.kernel.org/doc/html/latest/driver-api/usb/usb.html)
-* [ALSA Driver API docs](https://www.kernel.org/doc/html/latest/sound/kernel-api/alsa-driver-api.html)
-* [Writing an ALSA driver](https://www.kernel.org/doc/html/latest/sound/kernel-api/writing-an-alsa-driver.html)

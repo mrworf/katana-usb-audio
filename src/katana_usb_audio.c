@@ -112,8 +112,8 @@ static int katana_usb_probe(struct usb_interface *iface, const struct usb_device
 
 		// Basic info about the new sound card
 		strcpy(card->driver, "katana_ac");
-		strcpy(card->shortname, "Katana Audio");
-		strcpy(card->longname, "SoundBlaster X Katana");
+		strcpy(card->shortname, "SoundBlaster X Katana");
+		strcpy(card->longname, "Creative SoundBlaster X Katana USB Audio Device");
 		card->dev = &dev->dev;
 		
 		// Store the USB device in the card's private data for PCM operations

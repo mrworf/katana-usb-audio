@@ -1,0 +1,7 @@
+# Creative SoundBlaster X Katana USB Audio Driver
+# This rule ensures our specialized katana-usb-audio driver binds to the device
+# instead of the generic snd-usb-audio driver
+
+# Katana device: USB ID 041e:3247
+SUBSYSTEM=="usb", ATTR{idVendor}=="041e", ATTR{idProduct}=="3247", RUN+="/bin/sh -c 'echo 041e 3247 > /sys/bus/usb/drivers/snd-usb-audio/remove_id'"
+SUBSYSTEM=="usb", ATTR{idVendor}=="041e", ATTR{idProduct}=="3247", RUN+="/bin/sh -c 'echo 041e 3247 > /sys/bus/usb/drivers/katana_usb_audio/new_id'" 
