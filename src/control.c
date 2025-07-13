@@ -7,8 +7,8 @@
 #include <sound/pcm.h>
 #include "control.h"
 
-static int volume_value = 50; // Virtual value to be controlled (katana volume emulation)
-static int mute_value = 0;    // 0 = unmuted, 1 = muted
+static int volume_value = 5; // Start with very low volume to prevent ear damage
+static int mute_value = 1;    // 1 = unmuted, 0 = muted (ALSA convention)
 
 int katana_volume_get(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol)
 {
@@ -93,6 +93,19 @@ int katana_mute_info(struct snd_kcontrol *kctl, struct snd_ctl_elem_info *uinfo)
 
 	return 0;
 }
+
+// Add getter functions for use by PCM module
+int katana_get_volume(void)
+{
+	return volume_value;
+}
+EXPORT_SYMBOL(katana_get_volume);
+
+int katana_get_mute(void)
+{
+	return mute_value;
+}
+EXPORT_SYMBOL(katana_get_mute);
 
 // Control structure templates
 struct snd_kcontrol_new katana_vol_ctl = {
