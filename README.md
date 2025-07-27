@@ -23,7 +23,43 @@ The lack of working hardware buttons wasn't really a big issue, but the fact tha
 
 ## Installation
 
-### Quick Install (Recommended)
+### DKMS Installation (Recommended)
+DKMS (Dynamic Kernel Module Support) automatically rebuilds the driver when you install new kernels, ensuring continuous functionality across kernel updates.
+
+**Benefits of DKMS:**
+- ✅ Automatic rebuilding on kernel updates
+- ✅ No manual intervention required after system updates  
+- ✅ Persistent installation across reboots
+- ✅ Easy management with standard DKMS commands
+
+```bash
+# Install DKMS if not already installed
+# Ubuntu/Debian: sudo apt install dkms
+# Fedora/RHEL: sudo dnf install dkms  
+# Arch: sudo pacman -S dkms
+
+# Install the driver via DKMS
+sudo ./install-dkms.sh
+
+# Alternative: Use Makefile target
+sudo make dkms-install
+```
+
+This will:
+- Install the driver using DKMS for automatic kernel compatibility
+- Install udev rules for driver priority
+- Automatically rebuild on kernel updates
+- Load the driver immediately
+
+To uninstall DKMS version:
+```bash
+sudo ./uninstall-dkms.sh
+
+# Alternative: Use Makefile target
+sudo make dkms-uninstall
+```
+
+### Quick Install (Traditional)
 ```bash
 make
 sudo make install
@@ -34,6 +70,8 @@ This will:
 - Install it to `/lib/modules/$(uname -r)/extra/`
 - Install udev rules for driver priority
 - Update module dependencies
+
+**Note**: Traditional installation requires manual rebuilding after kernel updates.
 
 ### Manual Installation
 ```bash
@@ -50,6 +88,27 @@ sudo modprobe katana_usb_audio
 
 # Or simply:
 sudo modprobe katana_usb_audio
+```
+
+### DKMS Management
+If you installed via DKMS, you can use these commands to manage the driver:
+
+```bash
+# Check DKMS status
+dkms status
+# or
+make dkms-status
+
+# Manually rebuild (usually not needed)
+sudo dkms build katana-usb-audio/1.0
+sudo dkms install katana-usb-audio/1.0
+
+# Load/unload driver
+sudo modprobe katana_usb_audio     # Load
+sudo modprobe -r katana_usb_audio  # Unload
+
+# Check if driver is loaded
+lsmod | grep katana
 ```
 
 ### Uninstalling

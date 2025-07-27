@@ -39,4 +39,18 @@ uninstall:
 	udevadm control --reload-rules
 	@echo "Uninstall complete!"
 
-.PHONY: all clean install uninstall
+dkms-install:
+	@echo "Installing via DKMS..."
+	@chmod +x install-dkms.sh
+	@./install-dkms.sh
+
+dkms-uninstall:
+	@echo "Uninstalling from DKMS..."
+	@chmod +x uninstall-dkms.sh
+	@./uninstall-dkms.sh
+
+dkms-status:
+	@echo "DKMS status for katana-usb-audio:"
+	@dkms status katana-usb-audio 2>/dev/null || echo "Package not found in DKMS"
+
+.PHONY: all clean install uninstall dkms-install dkms-uninstall dkms-status
