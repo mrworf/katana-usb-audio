@@ -165,6 +165,11 @@ If it doesn't seem to work properly, use `lsusb` and `lsusb -t` to see what driv
 1. **Device not appearing in PulseAudio**: Ensure the driver is loaded and check kernel logs with `dmesg`
 2. **No audio output**: Check if the device is selected as the default audio output in your desktop environment
 3. **Volume control not working**: Verify the ALSA controls are accessible with `amixer -c katana-usb-audio contents`
+4. **DKMS build fails with "unversioned module" error**: This occurs when you have manually installed the driver and then try to install via DKMS. Fix by uninstalling the manual version first:
+   ```bash
+   sudo make uninstall
+   sudo dkms install katana-usb-audio/1.0
+   ```
 
 ### Debug Information
 
