@@ -1,9 +1,10 @@
 obj-m += katana_usb_audio.o 
 
 PWD := $(CURDIR)
-KDIR := /lib/modules/$(shell uname -r)/build
+KVER ?= $(shell uname -r)
+KDIR := /lib/modules/$(KVER)/build
 UDEV_RULES_DIR := /etc/udev/rules.d
-MODULE_DIR := /lib/modules/$(shell uname -r)/extra
+MODULE_DIR := /lib/modules/$(KVER)/extra
 
 katana_usb_audio-objs := src/card.o src/control.o src/pcm.o src/usb.o src/katana_usb_audio.o
 
@@ -17,10 +18,15 @@ install: all
 	@echo "Installing Katana USB Audio driver..."
 	mkdir -p $(MODULE_DIR)
 	cp katana_usb_audio.ko $(MODULE_DIR)/
-	depmod -a
+	depmod -a $(KVER)
 	@echo "Installing udev rule for driver priority..."
 	cp 99-katana-usb-audio.rules $(UDEV_RULES_DIR)/
-	udevadm control --reload-rules
+	@echo "Attempting to reload udev rules (safe to ignore in build containers)..."
+	-@if [ -d /run/udev ] || [ -e /run/systemd/system ]; then \
+		udevadm control --reload-rules && udevadm trigger; \
+	else \
+		echo "Note: udev daemon not running (expected in image builds). Rules will load on next boot."; \
+	fi
 	@echo "Installation complete!"
 	@echo ""
 	@echo "To load the driver now, run:"
@@ -35,7 +41,7 @@ uninstall:
 	modprobe -r katana_usb_audio 2>/dev/null || true
 	rm -f $(MODULE_DIR)/katana_usb_audio.ko
 	rm -f $(UDEV_RULES_DIR)/99-katana-usb-audio.rules
-	depmod -a
+	depmod -a $(KVER)
 	udevadm control --reload-rules
 	@echo "Uninstall complete!"
 
