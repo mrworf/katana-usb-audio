@@ -1,7 +1,8 @@
 obj-m += katana_usb_audio.o 
 
 PWD := $(CURDIR)
-KDIR := /lib/modules/$(shell uname -r)/build
+KERNELRELEASE ?= $(shell uname -r)
+KDIR := /lib/modules/$(KERNELRELEASE)/build
 UDEV_RULES_DIR := /etc/udev/rules.d
 MODULE_DIR := /lib/modules/$(shell uname -r)/extra
 
